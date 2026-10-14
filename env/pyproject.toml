@@ -1,0 +1,62 @@
+# One Python environment for all the Python labs of APM_50441_EP (Labs 1, 3, 5, 6) and the tools in PC/tools.
+#
+# Local use (the environment lives outside Dropbox):
+#     set UV_PROJECT_ENVIRONMENT=%USERPROFILE%\.venvs\apm50441      (PowerShell: $env:UV_PROJECT_ENVIRONMENT=...)
+#     uv sync                       # core packages, enough for every lab core
+#     uv sync --all-extras          # everything used in the "To go further" parts
+#     uv run jupyter lab
+#
+# On Colab, each lab has its own pinned install cell (`uv pip install --python "{sys.executable}" ...`),
+# with the same versions as below.
+
+[project]
+name = "apm50441-labs"
+version = "2026.1"
+description = "Environment of the APM_50441_EP (Machine Learning 2) labs"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "numpy>=2.1",
+    "scipy",
+    "pandas>=2.2",
+    "pyarrow",
+    "polars==1.44.2",
+    "matplotlib",
+    "seaborn==0.13.2",
+    "scikit-learn==1.9.1",
+    "statsmodels",
+    "fairlearn==0.14.0",
+    "optuna==5.0.0",
+    "optuna-integration==5.0.0",
+    "imbalanced-learn",
+    "torch",
+    "gymnasium[toy-text]==1.2.*",
+    # notebooks and tools (PC/tools)
+    "jupyterlab",
+    "ipykernel",
+    "nbclient",
+    "nbconvert",
+    "nbformat",
+    "psutil",
+    "pytest",
+]
+
+[project.optional-dependencies]
+boost = ["xgboost==2.1.4", "lightgbm==4.7.0", "catboost"]
+automl = ["flaml[automl]==2.6.0", "cmaes==0.13.1"]
+tabular-fm = ["tabicl==2.1.1", "pytabkit[models]==1.7.3"]
+ts-fm = ["chronos-forecasting"]
+rl = ["stable-baselines3==2.9.0"]
+text = ["transformers==5.19.0", "sentence-transformers==6.1.0", "tokenizers", "tiktoken==0.14.0", "bm25s==0.3.13", "PyStemmer==3.1.0"]
+explain = ["shap==0.52.0"]
+
+[tool.uv]
+package = false
+
+# CPU build of PyTorch: smaller, and enough for every lab (Colab provides its own GPU build)
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

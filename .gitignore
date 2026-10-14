@@ -1,0 +1,8 @@
+.ipynb_checkpoints/
+__pycache__/
+.Rhistory
+.Rproj.user/
+.quarto/
+*_files/
+PC7/data/flights_parquet/
+PC7/data/flights.csv.gz

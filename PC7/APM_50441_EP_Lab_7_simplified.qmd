@@ -1,0 +1,250 @@
+---
+title: "APM_50441_EP - Machine Learning 2 - Lab 7: Machine learning at scale"
+format:
+  html:
+    toc: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+This lab illustrates the seventh lecture (*At Scale*) on the flights of the United States in 2015. Its goals are:
+
+- to read and store a large dataset efficiently (binary columnar formats, Parquet, partitions), and to use a sample when it is enough,
+- to compare engines for the split/apply/combine computations on the full data, in memory (`dplyr`, `data.table`, `duckdb`) and directly on files (`arrow`, `duckdb`),
+- to profile and optimize code, from the algorithm to the compiled language (`profvis`, `bench`, `Rcpp`),
+- to parallelize a cross validation, and to measure when it pays off (`mirai`, `purrr::in_parallel()`),
+- to serve a model with a REST API (`plumber2`) and a web application (`shiny` and `bslib`).
+
+The optional *To go further* part, after the core, can be skipped at first: it covers Map/Reduce by hand, Spark, larger-than-memory computations, the memory hierarchy, pipelines, in-database scoring and the deployment of models.
+
+::: {.no-handout}
+We use `R` with the `tidyverse`. Most of the tools of this lab are not in the slides, which focus on the concepts: they are the current (2026) R implementations of these concepts.
+
+**Working environment.** Colab is the simplest option: open the notebook version of this lab (`APM_50441_EP_Lab_7.ipynb`, *Open in Colab* link) with the R runtime, and run its first cell, which installs the packages. To work on your own computer, download the lab folder (the `.qmd` file and its files) or clone the course repository, open the `.qmd` file in RStudio or Positron (or VS Code with the R extension), and run it chunk by chunk or render it with Quarto. The packages are installed once with the script `PC/env/install_packages.R` (`source("install_packages.R")`, then `install_lab("lab7")`); Spark, only used in a *To go further* block, is installed separately with `install_spark()`. The data are read from the local files when they are present (otherwise they are downloaded).
+
+**Use of AI.** AI assistants are allowed, but you must be able to explain every line you use, and you should answer the *predict before you run* questions before running the code: the suggested code may not be correct!
+:::
+
+```{r}
+#| label: setup
+#| tags: [keep]
+library(tidyverse)
+library(data.table)
+library(arrow)
+library(duckdb)
+theme_set(theme_light())
+if (!file.exists("data/flights_sample.csv.gz")) {
+  dir.create("data", showWarnings = FALSE)
+  for (f in c("flights_sample.csv.gz", "airlines.csv")) {
+    download.file(paste0("https://raw.githubusercontent.com/APM-50441-EP/APM_50441_EP-2026-2027/main/PC7/data/", f), file.path("data", f), mode = "wb")
+  }
+}
+airlines <- read_csv("data/airlines.csv", show_col_types = FALSE)
+```
+
+The full dataset ($5.8$ million flights, $1.4$ GB in memory) is too large for the computations of Parts 1, 3, 4 and 5 on some laptops: they use a random sample of $10\%$ of the flights ($582\,000$ flights). Part 2 uses the full data, stored as Parquet files ($138$ MB, downloaded once): it needs about $4$ GB of memory, which Colab and most laptops have.
+
+## 1. Reading, storing and sampling
+
+**Question** *Predict before you run:* which reader is the fastest? Read `data/flights_sample.csv.gz` with `readr::read_csv`, `data.table::fread` and `arrow::read_csv_arrow`, and compare their times with `bench::mark` ($3$ iterations, `check = FALSE`). What is the size of the data in memory (`lobstr::obj_size`)?
+
+**Answer**
+
+```{r}
+# Your code here
+```
+
+---
+
+**Question** Write the flights as a Parquet dataset partitioned by `MONTH` (`arrow::write_dataset` in `data/flights_parquet`), and compare the size on disk with the CSV file. Then open it with `open_dataset`, and compute the mean arrival delay of the flights of December for each airline *without* loading the data in memory (`filter`, `group_by`, `summarise`, then `collect`). Compare the time with the same computation from the CSV file.
+
+**Answer**
+
+```{r}
+# Your code here
+```
+
+---
+
+The *sampling trick* (lecture): for many questions, a random sample is enough, as the precision of an estimate depends on the size of the sample. Often, we do not need the full population to obtain a good enough estimate (PC7, *Reservoir sampling*).
+
+**Question** Estimate the mean arrival delay of all the flights of the sample with random subsamples of $n = 100$, $1000$, $10\,000$ and $100\,000$ flights ($200$ subsamples each): compare the standard deviation of the estimates with $\sigma/\sqrt{n}$. Then compare a simple random subsample of $2004$ flights with a subsample *stratified* by month ($167$ flights each month, the monthly means being weighted by the proportions of the months).
+
+**Answer**
+
+```{r}
+# Your code here
+```
+
+---
+
+## 2. Split, apply, combine
+
+On the $10\%$ sample, every engine computes such aggregates in a few tens of milliseconds: the fixed costs (parsing the query, starting the threads, converting the results) dominate and hide the differences between the engines. This part uses the full data: $5.8$ million flights, stored as $12$ Parquet files (one per month, $138$ MB in all) downloaded once into `data/flights_full_parquet`.
+
+**Question** Load the full data in memory (`open_dataset(...) |> collect()`), and measure the time and the size (`lobstr::obj_size`). Then compute the mean arrival delay and the proportion of flights arriving more than $15$ minutes late for each airline, with `dplyr`, with `data.table` and with `duckdb` (through `dbplyr`: register the table in a DuckDB database with `duckdb_register`, then use the same `dplyr` verbs and `collect()`). Check that the results agree, and compare the times and the memory with `bench::mark`. Run the same comparison on the $10\%$ sample: how does each engine scale? Compare also the mean delays estimated on the sample with the exact ones.
+
+**Answer**
+
+```{r}
+# Your code here
+```
+
+---
+
+**Question** *Predict before you run:* is it faster to compute on data already in memory, or directly on the Parquet files? Compute the same statistics with Arrow (`open_dataset`, the same `dplyr` verbs and `collect()`) and with DuckDB (an SQL query on `read_parquet('data/flights_full_parquet/*/*.parquet', hive_partitioning = true)`), directly from the files. Check the results, and compare the times and the memory of the R session with the engines of the previous question.
+
+**Answer**
+
+```{r}
+# Your code here
+```
+
+---
+
+**Question** Join the results with the full names of the airlines and plot the mean delay and the proportion of late flights. With DuckDB, display the SQL query generated by `dbplyr` (`show_query()`).
+
+**Answer**
+
+```{r}
+# Your code here
+```
+
+---
+
+## 3. Profiling and optimizing
+
+The cumulated arrival delay along the year can be computed with `cumsum`. To understand where the time goes, we write this function ourselves (PC7, *Complexity of cumulative sums*).
+
+```{r}
+#| label: cumsum-0
+#| tags: [keep]
+cumsum_0 <- function(x) {
+  res <- numeric(0)
+  for (i in seq_along(x)) {
+    res[i] <- 0
+    for (j in seq_len(i)) res[i] <- res[i] + x[j]
+  }
+  res
+}
+```
+
+**Question** *Predict before you run:* how does the time of `cumsum_0` grow with the length $n$ of `x`? Measure it for $n = 250, 500, 1000, 2000$ and plot it in log-log scale.
+
+**Answer**
+
+```{r}
+# Your code here
+```
+
+---
+
+**Question** Write `cumsum_1` with a single loop (`res[i] <- res[i - 1] + x[i]`) growing the result vector, `cumsum_2` with a preallocated result (`numeric(length(x))`), and compare them with the built-in `cumsum` for $n = 10^5$. Then, if a compiler is available (`pkgbuild::has_build_tools()`), compile the C++ functions of `cumsum.cc` with `Rcpp::sourceCpp` and add them to the comparison.
+
+**Answer**
+
+```{r}
+# Your code here
+```
+
+---
+
+**Question** Profile the computation of the cumulated delay along the year (sort the flights by date and departure time, compute the cumulated sum, build the dates, plot) with `profvis`. Which step takes the most time? Is `cumsum` worth optimizing?
+
+**Answer**
+
+```{r}
+# Your code here
+```
+
+---
+
+## 4. Parallel cross validation
+
+We want to predict the arrival delay from the information available at the departure. We compare $5$ linear models by an $8$-fold cross validation (note: in a formula, `DEPARTURE_DELAY/SCHEDULED_TIME` means *nesting*, not a ratio: the ratio is written `I(DEPARTURE_DELAY / SCHEDULED_TIME)`).
+
+```{r}
+#| label: cv-setup
+#| tags: [keep]
+flights_model_data <- flights |> select(ARRIVAL_DELAY, DEPARTURE_DELAY, SCHEDULED_TIME, AIRLINE) |> drop_na()
+formulas <- c("ARRIVAL_DELAY ~ DEPARTURE_DELAY",
+              "ARRIVAL_DELAY ~ DEPARTURE_DELAY + SCHEDULED_TIME",
+              "ARRIVAL_DELAY ~ DEPARTURE_DELAY + SCHEDULED_TIME + I(DEPARTURE_DELAY / SCHEDULED_TIME)",
+              "ARRIVAL_DELAY ~ DEPARTURE_DELAY + SCHEDULED_TIME + I(DEPARTURE_DELAY / SCHEDULED_TIME) + AIRLINE",
+              "ARRIVAL_DELAY ~ (DEPARTURE_DELAY + SCHEDULED_TIME + I(DEPARTURE_DELAY / SCHEDULED_TIME)) * AIRLINE")
+set.seed(2)
+folds <- sample(rep(1:8, length.out = nrow(flights_model_data)))
+cv_rmse <- function(formula, fold, data, folds) {
+  fit <- lm(as.formula(formula), data = data[folds != fold, ])
+  sqrt(mean((predict(fit, data[folds == fold, ]) - data$ARRIVAL_DELAY[folds == fold])^2))
+}
+tasks <- expand_grid(formula = formulas, fold = 1:8)
+```
+
+**Question** Compute the $40$ cross validation errors sequentially with `map2_dbl`, and display the mean CV RMSE of each model. Which model would you choose?
+
+**Answer**
+
+```{r}
+# Your code here
+```
+
+---
+
+**Question** Start $4$ background R processes with `mirai::daemons(4)`, and run the same computation in parallel with `map2_dbl(..., .f = in_parallel(\(formula, fold) ..., cv_rmse = cv_rmse, data = flights_model_data, folds = folds))`: the function sent to the workers must be self-contained, its objects being passed explicitly. Compare the times. Then measure the time of a parallel computation whose tasks are tiny (e.g. the mean of $100$ numbers, $40$ times). Explain the results with PC7, *Speed-up laws*.
+
+**Answer**
+
+```{r}
+# Your code here
+```
+
+---
+
+## 5. Serving a model
+
+The chosen model has to be made available: to people through a web application, to other programs through a REST API.
+
+**Question** Fit the fourth model on all the data. What is its size in memory? Which of its components take the space? Reduce it with `butcher::butcher()`; then remove by hand the components that `predict` does not need (the $QR$ decomposition matrix `qr$qr`, the `effects`, the `residuals` and the `model` data frame). Check that its predictions are unchanged, and save it in `flights_model.rds`.
+
+**Answer**
+
+```{r}
+# Your code here
+```
+
+---
+
+The file `flights_api.R` describes a REST API with `plumber2`: comments `#*` above a function declare the route (`@get /predict`), the expected query parameters and their types, and the format of the answer.
+
+```{r}
+#| label: api-file
+#| tags: [keep]
+cat(readLines("flights_api.R"), sep = "\n")
+```
+
+**Question** Start the API in a background R process (`callr::r_bg`), wait until it answers, and query it with `httr2` for a flight of American Airlines with a departure delay of $30$ minutes and a scheduled time of $180$ minutes. Compare with `predict`. Then write a `testthat` test of the API that does not need a running server (`plumber2::api("flights_api.R")$test_request(fiery::fake_request(url))`).
+
+**Answer**
+
+```{r}
+# Your code here
+```
+
+---
+
+The file `flights_app.R` is a `shiny` application, with a `bslib` layout, using the same model: run it from RStudio (*Run App*) or with `shiny::runApp("flights_app.R")`.
+
+```{r}
+#| label: app-file
+#| tags: [keep]
+cat(readLines("flights_app.R"), sep = "\n")
+```
+
+## About this lab
+
+**Use of AI.** Artificial intelligence tools have been used to revise the content of this lab. The main contributor takes full responsibility for this content.
+
+**License.** The texts of this lab are under the [Creative Commons Attribution-ShareAlike 4.0](https://creativecommons.org/licenses/by-sa/4.0/) license (CC BY-SA 4.0), and its code under the [MIT](https://opensource.org/license/mit) license; the datasets keep their own licenses. Main contributor: E. Le Pennec. Contributors: S. Boucheron, A. Dieuleveut, A.K. Fermin, S. Gadat, S. Gaiffas, B. Goujaud, A. Guilloux, Ch. Keribin, Th. Klein, E. Matzner, J. Read, M. Sangnier, E. Scornet.
