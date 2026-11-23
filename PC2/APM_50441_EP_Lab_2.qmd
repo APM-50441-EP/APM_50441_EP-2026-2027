@@ -145,7 +145,7 @@ fit_method <- function(formula, spec, data) fit(workflow(formula, spec), data)
 PC2 (Exercise 1) shows that the excess risk of a plug-in classifier is controlled by the quality of $\hat\eta$:
 $$\mathcal{R}(\hat f) - \mathcal{R}^\star \leq 2\, \mathbb{E}\left[|\hat\eta(X) - \eta(X)|\right] \leq \left(2\, \mathbb{E}\left[\text{KL}(\eta(X), \hat\eta(X))\right]\right)^{1/2}.$$
 
-**Question** For each method and for $n \in \{50, 200, 1000, 5000\}$ (with $3$ repetitions), compute the excess risk and the two bounds on `test`. Does the bound hold? Is it tight? Which methods have an excess risk that does not vanish when $n$ grows, and why? (The probabilities are clipped in $[10^{-3}, 1-10^{-3}]$ in the Kullback–Leibler divergence, which is infinite when $\hat\eta \in \{0,1\}$.)
+**Question** For each method and for $n \in \{50, 200, 1000, 5000\}$ (with $3$ repetitions), compute the excess risk and the two bounds on `test`. Does the bound hold? Is it tight? Which methods have an excess risk that does not vanish when $n$ grows, and why? (The probabilities are clipped in $[10^{-3}, 1-10^{-3}]$ for both bounds, which is infinite when $\hat\eta \in \{0,1\}$.)
 
 **Answer**
 
@@ -292,10 +292,14 @@ The following blocks are optional and independent: each of them only uses the ob
 
 ### Generative versus discriminative learning curves (★★)
 
-Ng and Jordan (2001) compared a generative classifier and its discriminative counterpart: when the generative model is right, it converges faster; when it is wrong, it converges to a worse rule, and the discriminative one wins for large $n$. LDA and the (linear) logistic regression are such a pair: both give a linear rule (PC2, *Linear discriminant analysis is a linear classifier*), LDA by modeling $P(X \mid Y)$ (Gaussian classes with the same covariance), the logistic regression by modeling $P(Y \mid X)$ directly (linear log-odds). We compare them in dimension $d = 20$ on two problems where $\eta$ is known:
+Ng and Jordan (2001) compared a generative classifier and its discriminative counterpart: when its assumptions hold, the generative model can achieve lower risk at a given sample size; when it is wrong, it converges to a worse rule, and the discriminative one wins for large $n$. LDA and the (linear) logistic regression are such a pair: both give a linear rule (PC2, *Linear discriminant analysis is a linear classifier*), LDA by modeling $P(X \mid Y)$ (Gaussian classes with the same covariance), the logistic regression by modeling $P(Y \mid X)$ directly (linear log-odds). We compare them in dimension $d = 20$ on two problems where $\eta$ is known:
 
 - (a) Gaussian classes with the same covariance: both models are right;
-- (b) independent exponential features, $X_j \mid Y = k \sim \mathcal{E}(\lambda_{kj})$: the log-odds $\log\frac{P(Y = 2 \mid x)}{P(Y = 1 \mid x)} = \sum_j \left(\log\frac{\lambda_{2j}}{\lambda_{1j}} - (\lambda_{2j} - \lambda_{1j})\, x_j\right)$ are linear (the logistic model is right), but the classes are not Gaussian (LDA is wrong).
+- (b) independent exponential features, $X_j \mid Y = k \sim \mathcal{E}(\lambda_{kj})$: the log-odds
+
+  $$\log\frac{P(Y = 2 \mid x)}{P(Y = 1 \mid x)} = \sum_j \left(\log\frac{\lambda_{2j}}{\lambda_{1j}} - (\lambda_{2j} - \lambda_{1j})\, x_j\right)$$
+
+  are linear (the logistic model is right), but the classes are not Gaussian (LDA is wrong).
 
 **Question** Simulate both problems, and compute the excess risk of the LDA and of the logistic regression for $n \in \{30, 50, 100, 200, 500, 1000, 5000, 20000\}$ (averaged over $20$ repetitions, on a test sample of $20\,000$ points). Plot the learning curves in log-log scale.
 
@@ -339,7 +343,7 @@ The penalized logistic regression minimizes the negative log-likelihood plus $\l
 
 A kernel SVM never computes the features: it only uses the kernel $k(x, x') = \exp(-\gamma\|x - x'\|^2)$ between pairs of points, at a cost which grows like $n^2$. *Random Fourier features* (Rahimi and Recht, 2007) approximate this kernel with explicit features $z(x) = \sqrt{2/D}\cos(Wx + b)$, with $W \sim \mathcal{N}(0, 2\gamma I)$ and $b \sim \mathcal{U}[0, 2\pi]$: $z(x)^\top z(x') \approx k(x, x')$.
 
-**Question** On our simulated problem ($n = 2000$), compare the excess risk and the fitting time of an RBF SVM (`kernlab`, $\gamma = 0.5$) with a logistic regression on $D \in \{2, 10, 50, 200\}$ random features, with a small ridge penalty (`glmnet`, penalty $10^{-3}$, `mixture = 0`; without any penalty, the fit diverges as soon as the features can almost separate the training points). Check also the approximation of the kernel.
+**Question** On our simulated problem ($n = 2000$), compare the excess risk and the fitting time of an RBF SVM (`kernlab`, $\gamma = 0.5$) with a logistic regression on $D \in \{2, 10, 50, 200\}$ random features, with a small ridge penalty (`glmnet`, penalty $10^{-3}$, `mixture = 0`; without any penalty, near separation can produce large finite coefficients. Complete or quasi-complete separation can prevent a finite optimum). Check also the approximation of the kernel.
 
 **Answer**
 
@@ -353,7 +357,7 @@ A kernel SVM never computes the features: it only uses the kernel $k(x, x') = \e
 
 In a linear regression on $D$ random features, the least squares fit interpolates the data as soon as $D \geq n$. Among all the interpolating solutions, the *minimum norm* one (given by the pseudo-inverse) behaves surprisingly well: its test error, which explodes when $D \approx n$ (as the random design error of the previous blocks), decreases again for $D \gg n$. This *double descent* is one of the clues to understand overparametrized neural networks.
 
-**Question** Regress $y = \sin(2\,a^\top x) + \varepsilon$ ($x \sim \mathcal{N}(0, I_{10})$, a fixed random direction $a$ of norm about $1$, $\sigma = 0.3$, $n = 100$) on $D$ random ReLU features $\max(0, w^\top x + b)$ ($w \sim \mathcal{N}(0, I/10)$, $b \sim \mathcal{N}(0, 1)$), with the minimum norm least squares solution, for $D$ from $5$ to $3000$. Plot the test error as a function of $D$ (median of $20$ repetitions, log scales).
+**Question** Regress $y = \sin(2\,a^\top x) + \varepsilon$ ($x \sim \mathcal{N}(0, I_{10})$, a fixed random direction $a$ of norm about $1$, $\sigma = 0.3$, $n = 100$) on $D$ random ReLU features $\max(0, w^\top x + b)$ ($w \sim \mathcal{N}(0, I/10)$, $b \sim \mathcal{N}(0, 1)$), with the minimum norm least squares solution, for $D$ from $5$ to $3000$. Plot the squared error against the noiseless regression function as a function of $D$ (median of $20$ repetitions, log scales).
 
 **Answer**
 

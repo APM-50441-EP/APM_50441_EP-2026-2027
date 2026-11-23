@@ -145,7 +145,7 @@ fit_method <- function(formula, spec, data) fit(workflow(formula, spec), data)
 PC2 (Exercise 1) shows that the excess risk of a plug-in classifier is controlled by the quality of $\hat\eta$:
 $$\mathcal{R}(\hat f) - \mathcal{R}^\star \leq 2\, \mathbb{E}\left[|\hat\eta(X) - \eta(X)|\right] \leq \left(2\, \mathbb{E}\left[\text{KL}(\eta(X), \hat\eta(X))\right]\right)^{1/2}.$$
 
-**Question** For each method and for $n \in \{50, 200, 1000, 5000\}$ (with $3$ repetitions), compute the excess risk and the two bounds on `test`. Does the bound hold? Is it tight? Which methods have an excess risk that does not vanish when $n$ grows, and why? (The probabilities are clipped in $[10^{-3}, 1-10^{-3}]$ in the Kullback–Leibler divergence, which is infinite when $\hat\eta \in \{0,1\}$.)
+**Question** For each method and for $n \in \{50, 200, 1000, 5000\}$ (with $3$ repetitions), compute the excess risk and the two bounds on `test`. Does the bound hold? Is it tight? Which methods have an excess risk that does not vanish when $n$ grows, and why? (The probabilities are clipped in $[10^{-3}, 1-10^{-3}]$ for both bounds, which is infinite when $\hat\eta \in \{0,1\}$.)
 
 **Answer**
 

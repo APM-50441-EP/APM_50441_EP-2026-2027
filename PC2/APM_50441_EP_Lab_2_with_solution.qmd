@@ -1,0 +1,908 @@
+---
+title: "APM_50441_EP - Machine Learning 2 - Lab 2: Inside the methods, and the tidymodels workflow"
+format:
+  html:
+    toc: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+This lab illustrates the second lecture (*A Review of the Methods Seen So Far*). Its goals are:
+
+- to compare classifiers with the *truth*: on a simulated problem, we know the conditional probability $\eta(x) = \mathbb{P}(Y = \text{Class1} | X = x)$, hence the Bayes classifier and its risk $\mathcal{R}^\star$, and we can measure the *excess risk* of each method,
+- to see the two points of view of the lecture at work: the probabilistic one (plug-in classifiers) and the optimization one (empirical risk minimization of a convex surrogate),
+- to measure the bias–variance trade-off of a local method,
+- to learn the `tidymodels` workflow (recipes, workflows, tuning, workflow sets, metrics) on the TwoClass data of the lecture.
+
+The optional *To go further* part, after the core, can be skipped at first.
+
+::: {.no-handout}
+We use `R` with `tidyverse` and `tidymodels`.
+
+**Working environment.** Colab is the simplest option: open the notebook version of this lab (`APM_50441_EP_Lab_2.ipynb`, *Open in Colab* link) with the R runtime, and run its first cell, which installs the packages. To work on your own computer, download the lab folder (the `.qmd` file and its files) or clone the course repository, open the `.qmd` file in RStudio or Positron (or VS Code with the R extension), and run it chunk by chunk or render it with Quarto. The packages are installed once with the script `PC/env/install_packages.R` (`source("install_packages.R")`, then `install_lab("lab2")`). The data are read from the local files when they are present (otherwise they are downloaded).
+
+**Use of AI.** AI assistants are allowed, but you must be able to explain every line you use, and you should answer the *predict before you run* questions before running the code: the suggested code may not be correct!
+:::
+
+```{r}
+#| label: setup
+#| tags: [keep]
+library(tidyverse)
+library(tidymodels)
+library(discrim)      # LDA, QDA and naive Bayes in parsnip
+library(patchwork)
+library(mvtnorm)
+tidymodels_prefer()
+theme_set(theme_light())
+if (!file.exists("data/twoClassData.csv")) {  # downloaded only if there is no local copy
+  dir.create("data", showWarnings = FALSE)
+  download.file("https://raw.githubusercontent.com/APM-50441-EP/APM_50441_EP-2026-2027/main/PC2/data/twoClassData.csv",
+                "data/twoClassData.csv")
+}
+```
+
+## 1. The problem and its Bayes classifier
+
+We simulate a two-class problem in which each class is Gaussian, with different covariances: $X | Y = \text{Class1} \sim \mathcal{N}(\mu_1, \Sigma_1)$ and $X | Y = \text{Class2} \sim \mathcal{N}(\mu_2, \Sigma_2)$, with equal priors. As the model is known, $\eta(x)$ can be computed with Bayes' formula. The following helpers are given:
+
+- `simulate(n, noise = 0)` draws $n$ observations (with `noise` additional useless features),
+- `eta(data)` computes $\eta(x)$ for each row,
+- `excess_risk(pred_class, test)` computes the excess risk $\mathcal{R}(\hat f) - \mathcal{R}^\star = \mathbb{E}\left[\mathbf{1}_{\hat f(X) \neq f^\star(X)} |2\eta(X) - 1|\right]$ on a test set where `eta` is known (this formula has a much smaller variance than the difference of two empirical risks),
+- `decision_map(fitted, data)` plots the estimated probability of `Class1`, the decision boundary of a fitted model (solid) and the Bayes boundary (dashed).
+
+```{r}
+#| label: helpers
+#| tags: [keep]
+mu1 <- c(0, 0); Sigma1 <- diag(2)
+mu2 <- c(1.5, 1); Sigma2 <- matrix(c(2, 0.9, 0.9, 0.6), 2)
+
+simulate <- function(n, noise = 0) {
+  y <- rbinom(n, 1, 0.5)
+  x <- matrix(0, n, 2)
+  x[y == 0, ] <- rmvnorm(sum(y == 0), mu1, Sigma1)
+  x[y == 1, ] <- rmvnorm(sum(y == 1), mu2, Sigma2)
+  data <- tibble(x1 = x[, 1], x2 = x[, 2])
+  if (noise > 0) {
+    data <- bind_cols(data, as_tibble(matrix(rnorm(n * noise), n, noise), .name_repair = ~ paste0("noise", seq_along(.x))))
+  }
+  data |> mutate(class = factor(if_else(y == 0, "Class1", "Class2"), levels = c("Class1", "Class2")))
+}
+
+eta <- function(data) {
+  x <- cbind(data$x1, data$x2)
+  d1 <- dmvnorm(x, mu1, Sigma1)
+  d2 <- dmvnorm(x, mu2, Sigma2)
+  d1 / (d1 + d2)
+}
+
+excess_risk <- function(pred_class, test) {
+  bayes <- if_else(test$eta > 0.5, "Class1", "Class2")
+  mean((as.character(pred_class) != bayes) * abs(2 * test$eta - 1))
+}
+
+grid <- expand_grid(x1 = seq(-3, 5, length.out = 120), x2 = seq(-3, 4, length.out = 120))
+grid <- grid |> mutate(eta = eta(grid))
+
+decision_map <- function(fitted, data, title = "") {
+  pred <- grid |> bind_cols(predict(fitted, grid, type = "prob"))
+  ggplot(pred, aes(x1, x2)) +
+    geom_raster(aes(fill = .pred_Class1), alpha = 0.6) +
+    geom_contour(aes(z = .pred_Class1), breaks = 0.5, color = "black") +
+    geom_contour(aes(z = eta), breaks = 0.5, color = "black", linetype = "dashed") +
+    geom_point(data = data, aes(color = class), size = 0.8) +
+    scale_fill_gradient2(low = "#2a78d6", mid = "white", high = "#eb6834", midpoint = 0.5, limits = c(0, 1)) +
+    scale_color_manual(values = c(Class1 = "#eb6834", Class2 = "#2a78d6")) +
+    coord_equal(expand = FALSE) + labs(title = title, fill = "P(Class1)")
+}
+
+set.seed(42)
+test <- simulate(20000)
+test <- test |> mutate(eta = eta(test))
+train <- simulate(300)
+```
+
+**Question** Plot `train` with the Bayes boundary $\eta(x) = 1/2$, and estimate the Bayes risk $\mathcal{R}^\star = \mathbb{E}[\min(\eta(X), 1 - \eta(X))]$ with `test`. *Predict before you run:* what is the shape of the Bayes boundary?
+
+**Answer**
+
+```{r}
+#| label: bayes
+ggplot(grid, aes(x1, x2)) +
+  geom_raster(aes(fill = eta), alpha = 0.6) +
+  geom_contour(aes(z = eta), breaks = 0.5, color = "black", linetype = "dashed") +
+  geom_point(data = train, aes(color = class), size = 0.8) +
+  scale_fill_gradient2(low = "#2a78d6", mid = "white", high = "#eb6834", midpoint = 0.5) +
+  scale_color_manual(values = c(Class1 = "#eb6834", Class2 = "#2a78d6")) +
+  coord_equal(expand = FALSE)
+bayes_risk <- mean(pmin(test$eta, 1 - test$eta))
+bayes_risk
+```
+
+**Conclusion** The two classes have different covariances, so the log-odds $\log\frac{\eta(x)}{1-\eta(x)}$ is a quadratic function of $x$ and the Bayes boundary is a hyperbola. The precision difference has eigenvalues approximately $-0.590$ and $5.257$, so the plot shows only part of the boundary. Even the best possible classifier makes errors: the Bayes risk is $\mathcal{R}^\star \approx 0.19$, as the classes overlap. All the risks below are compared with this value.
+
+---
+
+## 2. Plug-in classifiers and the estimation of $\eta$
+
+In the probabilistic point of view, we estimate $\eta$ and plug the estimate in the Bayes rule: $\hat f(x) = \text{Class1}$ if $\hat\eta(x) > 1/2$. In `tidymodels`, a model is described by a *specification* (`parsnip`): its type, its mode and the *engine* (the R package) that fits it. All the specifications share the same `fit()` and `predict()` interface, and `predict(type = "prob")` gives the estimated probabilities.
+
+```{r}
+#| label: specifications
+#| tags: [keep]
+specifications <- tribble(
+  ~method,                ~formula,                                                       ~spec,
+  "logistic",             class ~ x1 + x2,                                                 logistic_reg(),
+  "quadratic logistic",   class ~ x1 + x2 + I(x1^2) + I(x2^2) + I(x1 * x2),                logistic_reg(),
+  "kNN (k = 25)",         class ~ x1 + x2,                                                 nearest_neighbor(neighbors = 25) |> set_mode("classification"),
+  "LDA",                  class ~ x1 + x2,                                                 discrim_linear(),
+  "QDA",                  class ~ x1 + x2,                                                 discrim_quad(),
+  "Gaussian naive Bayes", class ~ x1 + x2,                                                 naive_Bayes() |> set_engine("naivebayes")
+)
+fit_method <- function(formula, spec, data) fit(workflow(formula, spec), data)
+```
+
+**Question** Fit the six methods on `train`, and plot their decision maps. Which methods can represent the Bayes boundary?
+
+**Answer**
+
+```{r}
+#| label: fit-plugin
+#| fig-height: 9
+#| fig-width: 12
+fitted <- specifications |> mutate(fitted = map2(formula, spec, fit_method, data = train))
+map2(fitted$fitted, fitted$method, decision_map, data = train) |> wrap_plots(ncol = 3, guides = "collect")
+```
+
+**Conclusion** The logistic regression and the LDA produce a linear boundary, and the Gaussian naive Bayes a quadratic boundary with axis-aligned covariances: none of them can represent the Bayes boundary exactly (they are *misspecified*). The quadratic logistic regression and the QDA have the right form: the QDA *is* the true model, and the log-odds of the quadratic logistic regression is a general quadratic function, which contains the true one. The $k$-NN can approximate any boundary, but its boundary is irregular: it pays its flexibility with variance.
+
+---
+
+PC2 (Exercise 1) shows that the excess risk of a plug-in classifier is controlled by the quality of $\hat\eta$:
+$$\mathcal{R}(\hat f) - \mathcal{R}^\star \leq 2\, \mathbb{E}\left[|\hat\eta(X) - \eta(X)|\right] \leq \left(2\, \mathbb{E}\left[\text{KL}(\eta(X), \hat\eta(X))\right]\right)^{1/2}.$$
+
+**Question** For each method and for $n \in \{50, 200, 1000, 5000\}$ (with $3$ repetitions), compute the excess risk and the two bounds on `test`. Does the bound hold? Is it tight? Which methods have an excess risk that does not vanish when $n$ grows, and why? (The probabilities are clipped in $[10^{-3}, 1-10^{-3}]$ for both bounds, which is infinite when $\hat\eta \in \{0,1\}$.)
+
+**Answer**
+
+```{r}
+#| label: plugin-bound
+plugin_metrics <- function(fitted, test) {
+  eta_hat <- predict(fitted, test, type = "prob")$.pred_Class1
+  pred <- if_else(eta_hat > 0.5, "Class1", "Class2")
+  eta_clipped <- pmin(pmax(eta_hat, 1e-3), 1 - 1e-3)
+  kl <- test$eta * log(test$eta / eta_clipped) + (1 - test$eta) * log((1 - test$eta) / (1 - eta_clipped))
+  tibble(`excess risk` = excess_risk(pred, test), `L1 bound` = 2 * mean(abs(eta_clipped - test$eta)),
+         `KL bound` = sqrt(2 * mean(kl)))
+}
+set.seed(1)
+bounds <- expand_grid(n = c(50, 200, 1000, 5000), rep = 1:3) |>
+  mutate(data = map(n, simulate)) |>
+  cross_join(specifications) |>
+  mutate(metrics = pmap(list(formula, spec, data), \(formula, spec, data) plugin_metrics(fit_method(formula, spec, data), test))) |>
+  select(n, rep, method, metrics) |>
+  unnest(metrics)
+bounds |>
+  group_by(n, method) |> summarise(across(c(`excess risk`, `L1 bound`, `KL bound`), mean), .groups = "drop") |>
+  pivot_longer(c(`excess risk`, `L1 bound`, `KL bound`), names_to = "quantity") |>
+  ggplot(aes(n, value, color = quantity)) + geom_line() + geom_point() +
+  facet_wrap(~ method) + scale_x_log10() + scale_y_log10()
+```
+
+```{r}
+#| label: plugin-table
+bounds |> filter(n %in% c(200, 5000)) |>
+  group_by(method, n) |> summarise(across(c(`excess risk`, `L1 bound`), mean), .groups = "drop") |>
+  pivot_wider(names_from = n, values_from = c(`excess risk`, `L1 bound`))
+```
+
+**Conclusion** The bound holds for all methods and all sizes, but it is far from tight: for the QDA with $n = 200$, the excess risk is $0.004$ while $2\,\mathbb{E}|\hat\eta - \eta| \approx 0.08$. Errors on $\hat\eta$ only matter near the boundary, where they change the decision, while the bound counts them everywhere. The KL bound is even larger. Two groups of methods appear. For the correctly specified ones (QDA, quadratic logistic regression), the excess risk vanishes as $n$ grows ($0.0002$ and $0.0004$ for $n = 5000$): only the *estimation* error remains, and it decreases with $n$. For the misspecified ones (logistic, LDA, naive Bayes), the excess risk stays around $0.04$–$0.05$ whatever $n$: this is the *approximation* error, which data cannot remove. The $k$-NN with a fixed $k = 25$ improves with $n$ ($0.023$ to $0.010$) without reaching $0$: the neighborhood shrinks as $25/n \to 0$, but averaging only 25 labels leaves sampling variance.
+
+---
+
+## 3. Empirical risk minimization with convex surrogates
+
+In the optimization point of view, we look for $f(x) = \beta^\top \phi(x)$ minimizing the empirical risk of a loss $\ell(Y f(X))$ (with labels $Y \in \{-1, +1\}$, $+1$ for `Class1`). The $0/1$ loss $\mathbf{1}_{Yf(X) \leq 0}$ is replaced by a convex *surrogate*. We minimize it directly with `optim()` (with a very small ridge penalty to avoid divergence on separable data).
+
+```{r}
+#| label: erm-setup
+#| tags: [keep]
+phi_linear <- function(d) cbind(1, d$x1, d$x2)
+phi_quadratic <- function(d) cbind(1, d$x1, d$x2, d$x1^2, d$x2^2, d$x1 * d$x2)
+losses <- list(logistic = \(m) log1p(exp(-m)), exponential = \(m) exp(-m),
+               hinge = \(m) pmax(0, 1 - m), squared = \(m) (1 - m)^2)
+```
+
+**Question** Write a function `erm(loss, phi, data, lambda = 1e-4)` returning the coefficients $\hat\beta$, and compute, for the four losses and both feature maps, the excess risk of $\text{sign}(\hat f)$ on `test` (with `train`).
+
+**Answer**
+
+```{r}
+#| label: erm
+erm <- function(loss, phi, data, lambda = 1e-4) {
+  Phi <- phi(data)
+  y <- if_else(data$class == "Class1", 1, -1)
+  objective <- function(beta) mean(loss(y * drop(Phi %*% beta))) + lambda * sum(beta[-1]^2)
+  optim(rep(0, ncol(Phi)), objective, method = "BFGS", control = list(maxit = 2000))$par
+}
+erm_fits <- expand_grid(loss = names(losses), features = c("linear", "quadratic")) |>
+  mutate(phi = map(features, \(f) if (f == "linear") phi_linear else phi_quadratic),
+         beta = map2(loss, phi, \(l, phi) erm(losses[[l]], phi, train)),
+         f_test = map2(phi, beta, \(phi, beta) drop(phi(test) %*% beta)),
+         `excess risk` = map_dbl(f_test, \(f) excess_risk(if_else(f > 0, "Class1", "Class2"), test)))
+erm_fits |> select(loss, features, `excess risk`) |> pivot_wider(names_from = features, values_from = `excess risk`)
+```
+
+**Conclusion** With linear features, all the losses give an excess risk around $0.042$–$0.047$: the approximation error of the linear classifiers dominates, whatever the surrogate. With quadratic features, the excess risks drop to $0.003$ (logistic, exponential), $0.006$ (hinge) and $0.014$ (squared). All the surrogates lead to good classifiers, in this experiment. PC2 proves sign agreement for unrestricted population minimizers where they exist. A restricted feature map can change the optimum. The squared loss is the least efficient here, as it also penalizes the observations that are classified *too* confidently ($Yf > 1$).
+
+---
+
+**Question** PC2 (Exercise 2) shows that the minimizer of the surrogate risk has the sign of $2\eta - 1$, and computes the minimizer $\tilde f(\eta)$ for each loss: $\log\frac{\eta}{1-\eta}$ (logistic), $\frac12\log\frac{\eta}{1-\eta}$ (exponential), $\text{sign}(2\eta - 1)$ (hinge) and $2\eta - 1$ (squared). With the quadratic features, plot $\hat f(x)$ against $\eta(x)$ on $2000$ test points, together with the curves $\tilde f(\eta)$. Which losses give an estimate of $\eta$? Check also that the logistic ERM (with `lambda = 0`) gives the same coefficients as the maximum likelihood fit of `logistic_reg()`.
+
+**Answer**
+
+```{r}
+#| label: erm-eta
+f_star <- list(logistic = \(e) qlogis(e), exponential = \(e) qlogis(e) / 2, hinge = \(e) sign(2 * e - 1), squared = \(e) 2 * e - 1)
+erm_fits |> filter(features == "quadratic") |>
+  mutate(points = map(f_test, \(f) tibble(eta = test$eta[1:2000], f_hat = f[1:2000]))) |>
+  select(loss, points) |> unnest(points) |>
+  ggplot(aes(eta, f_hat)) + geom_point(size = 0.3, alpha = 0.3) +
+  facet_wrap(~ loss, scales = "free_y") +
+  geom_line(data = map_dfr(names(f_star), \(l) tibble(loss = l, eta = seq(0.01, 0.99, by = 0.01),
+                                                      f_hat = f_star[[l]](seq(0.01, 0.99, by = 0.01)))),
+            color = "#eb6834", linewidth = 1)
+```
+
+```{r}
+#| label: erm-mle
+mle <- fit(workflow(class ~ x1 + x2 + I(x1^2) + I(x2^2) + I(x1 * x2), logistic_reg()), train) |> tidy()
+# glm models P(second level) = P(Class2): its coefficients are the opposite of ours (Class1 = +1)
+tibble(term = mle$term, `logistic_reg()` = -mle$estimate, ERM = erm(losses$logistic, phi_quadratic, train, lambda = 0))
+```
+
+**Conclusion** The points follow the predicted curves $\tilde f(\eta)$: the logistic and exponential scores are increasing functions of $\eta$, from which $\eta$ can be recovered ($\eta = 1/(1+e^{-\hat f})$ and $1/(1+e^{-2\hat f})$). The squared loss also gives an estimate, $(1 + \hat f)/2$, but a poor one. The hinge scores saturate around $\pm 1$ away from the boundary: they give the decision, not the probability, as for an SVM. The logistic ERM and the maximum likelihood fit of `logistic_reg()` give the same coefficients (up to the sign convention of the classes): the logistic regression is at the same time a plug-in method (it estimates $\eta$) and an empirical risk minimization of the logistic surrogate.
+
+---
+
+**Question** The $0/1$ loss is not minimized directly. Starting from the logistic solution with the linear features, plot the empirical $0/1$ risk and the empirical logistic risk along the intercept $\beta_0 + t$, for $t \in [-3, 3]$. Why is the $0/1$ empirical risk hard to minimize?
+
+**Answer**
+
+```{r}
+#| label: zero-one
+beta <- erm(losses$logistic, phi_linear, train)
+y_train <- if_else(train$class == "Class1", 1, -1)
+Phi <- phi_linear(train)
+tibble(t = seq(-3, 3, length.out = 601)) |>
+  mutate(margins = map(t, \(t) y_train * drop(Phi %*% (beta + c(t, 0, 0)))),
+         `0/1 risk` = map_dbl(margins, \(m) mean(m <= 0)),
+         `logistic risk` = map_dbl(margins, \(m) mean(log1p(exp(-m))))) |>
+  pivot_longer(c(`0/1 risk`, `logistic risk`), names_to = "risk") |>
+  ggplot(aes(t, value)) + geom_line() + facet_wrap(~ risk, scales = "free_y")
+```
+
+**Conclusion** The empirical $0/1$ risk is piecewise constant: its gradient is zero almost everywhere, it jumps each time the boundary crosses an observation, and it has many local minima. In dimension $d$, minimizing it is NP-hard in general. The logistic risk is smooth and convex, with a unique minimum: it can be minimized by gradient methods, and its minimizer has the right sign (PC2). This is the *convexification* of the lecture.
+
+---
+
+## 4. Local averaging and the bias–variance trade-off
+
+The $k$-nearest neighbors estimate $\eta(x)$ by the proportion of `Class1` among the $k$ closest training points. With the known $\eta$, we can measure by Monte Carlo the *bias* $\mathbb{E}[\hat\eta(x)] - \eta(x)$ and the *variance* $\text{Var}[\hat\eta(x)]$ of the estimate at some points $x$, over many training sets.
+
+**Question** *Predict before you run:* how should the squared bias and the variance depend on $k$? For $k \in \{1, 5, 15, 45, 101\}$, draw $50$ training sets of size $200$ and compute, averaged over $300$ evaluation points, the squared bias and the variance of $\hat\eta$, as well as the average excess risk (on the first $5000$ test points).
+
+**Answer**
+
+```{r}
+#| label: knn-bias-variance
+ks <- c(1, 5, 15, 45, 101)
+set.seed(2)
+points <- simulate(300)
+points <- points |> mutate(eta = eta(points))
+test_small <- test |> slice_head(n = 5000)
+monte_carlo <- map_dfr(1:50, function(r) {
+  data <- simulate(200)
+  map_dfr(ks, function(k) {
+    fitted_knn <- fit_method(class ~ x1 + x2, nearest_neighbor(neighbors = k) |> set_mode("classification"), data)
+    tibble(rep = r, k = k, point = seq_len(nrow(points)), eta = points$eta,
+           eta_hat = predict(fitted_knn, points, type = "prob")$.pred_Class1,
+           excess = excess_risk(predict(fitted_knn, test_small)$.pred_class, test_small))
+  })
+})
+bias_variance <- monte_carlo |>
+  group_by(k, point) |> summarise(bias2 = (mean(eta_hat) - first(eta))^2, variance = var(eta_hat),
+                                  excess = mean(excess), .groups = "drop") |>
+  group_by(k) |> summarise(`squared bias` = mean(bias2), variance = mean(variance), `excess risk` = mean(excess))
+bias_variance
+bias_variance |> pivot_longer(-k) |> ggplot(aes(k, value, color = name)) + geom_line() + geom_point() + scale_x_log10()
+```
+
+**Conclusion** The variance of $\hat\eta$ decreases quickly with $k$ (from $0.13$ for $k = 1$ to $0.003$ for $k = 101$, roughly like $1/k$), while the squared bias increases (from $0.003$ to $0.027$): averaging over more neighbors means averaging over a larger region, where $\eta$ varies. The excess risk is U-shaped, with a minimum around $k = 45$ ($0.018$), much better than $k = 1$ ($0.066$, too much variance) or $k = 101$ ($0.028$, too much bias): this is the bias–variance trade-off of the lecture.
+
+---
+
+In practice $\eta$ is unknown and $k$ is chosen by cross validation. With `tidymodels`, a parameter to tune is marked with `tune()`, and `tune_grid()` evaluates a grid of values on resamples (`rsample`).
+
+**Question** On one training set of size $200$, choose $k$ with a $10$-fold cross validation of the accuracy (`tune_grid()`), and compare it with the best $k$ of the Monte Carlo experiment. Then add $8$ useless noise features (`simulate(200, noise = 8)`): what happens to the excess risk of the $25$-nearest neighbors?
+
+**Answer**
+
+```{r}
+#| label: knn-tune
+set.seed(3)
+data <- simulate(200)
+knn_tuning <- tune_grid(workflow(class ~ x1 + x2, nearest_neighbor(neighbors = tune()) |> set_mode("classification")),
+                        resamples = vfold_cv(data, v = 10, strata = class), grid = tibble(neighbors = ks),
+                        metrics = metric_set(accuracy))
+show_best(knn_tuning, metric = "accuracy")
+```
+
+```{r}
+#| label: knn-noise
+set.seed(4)
+noisy_test <- simulate(5000, noise = 8)
+noisy_test <- noisy_test |> mutate(eta = eta(noisy_test))
+map_dfr(c(0, 2, 8), function(noise) {
+  map_dfr(1:10, \(r) tibble(noise = noise, excess = excess_risk(
+    predict(fit_method(class ~ ., nearest_neighbor(neighbors = 25) |> set_mode("classification"), simulate(200, noise = noise)),
+            noisy_test |> select(x1, x2, num_range("noise", seq_len(noise))))$.pred_class, noisy_test)))
+}) |> group_by(noise) |> summarise(`excess risk of the 25-NN` = mean(excess))
+```
+
+**Conclusion** The cross validation selects $k = 45$, the best value of the Monte Carlo experiment, although its estimates are noisy (standard errors of about $0.02$ on the accuracy, larger than some of the differences between the values of $k$). With useless noise features, the neighbors are computed in a space where most directions carry no information, and the excess risk of the $25$-NN grows from $0.019$ to $0.043$ (2 noise features) and $0.071$ (8 noise features). Local methods suffer from the dimension: this is a first glimpse of the *curse of dimensionality* (Lecture 4).
+
+---
+
+## 5. The tidymodels workflow on real data: TwoClass
+
+We now use the TwoClass data of the lecture (Kuhn and Johnson, *Applied Predictive Modeling*): $208$ observations, two predictors and two classes. The truth is unknown: we have to rely on resampling. A complete `tidymodels` analysis has the following steps:
+
+- `rsample`: split the data into a training and a test set (`initial_split`), and resample the training set (`vfold_cv`),
+- `recipes`: describe the preprocessing (normalization, feature design...), estimated on the training part of each resample,
+- `parsnip`: describe the models, `workflows`: bundle a recipe and a model,
+- `tune` and `workflowsets`: evaluate many workflows and their hyperparameters on the resamples,
+- `yardstick`: compute the metrics.
+
+```{r}
+#| label: twoclass
+#| tags: [keep]
+two_class <- read_csv("data/twoClassData.csv", show_col_types = FALSE) |> mutate(classes = factor(classes))
+set.seed(42)
+split <- initial_split(two_class, prop = 0.75, strata = classes)
+train_tc <- training(split)
+test_tc <- testing(split)
+folds <- vfold_cv(train_tc, v = 5, repeats = 3, strata = classes)
+ggplot(train_tc, aes(PredictorA, PredictorB, color = classes)) + geom_point() + coord_equal()
+```
+
+**Question** Define two recipes (normalized predictors, and normalized predictors with polynomials of degree $2$) and the following models: logistic regression, $k$-NN ($k$ tuned), LDA, QDA, naive Bayes, penalized logistic regression (`glmnet`, penalty and mixture tuned), SVM with a radial kernel (`kernlab`, cost and scale tuned), a one-hidden-layer perceptron (`brulee`, size and penalty tuned) and a classification tree (cost-complexity tuned). Build a `workflow_set()` crossing them (the polynomial recipe only for the logistic and penalized logistic regressions), and evaluate it with `workflow_map("tune_grid", grid = 6)` on `folds` for the accuracy, the ROC AUC and the Brier score. Rank the workflows.
+
+**Answer**
+
+```{r}
+#| label: workflow-set
+mirai::daemons(4)  # tune 2.x runs the resamples in parallel with mirai (or future)
+base_recipe <- recipe(classes ~ ., data = train_tc) |> step_normalize(all_predictors())
+poly_recipe <- base_recipe |> step_poly(all_predictors(), degree = 2)
+models <- list(
+  logistic = logistic_reg(),
+  knn = nearest_neighbor(neighbors = tune()) |> set_mode("classification"),
+  lda = discrim_linear(),
+  qda = discrim_quad(),
+  naive_bayes = naive_Bayes() |> set_engine("naivebayes"),
+  glmnet = logistic_reg(penalty = tune(), mixture = tune()) |> set_engine("glmnet"),
+  svm = svm_rbf(cost = tune(), rbf_sigma = tune()) |> set_mode("classification"),
+  mlp = mlp(hidden_units = tune(), penalty = tune(), epochs = 200) |> set_engine("brulee") |> set_mode("classification"),
+  tree = decision_tree(cost_complexity = tune()) |> set_mode("classification"))
+workflows <- bind_rows(
+  workflow_set(preproc = list(base = base_recipe), models = models),
+  workflow_set(preproc = list(poly = poly_recipe), models = models[c("logistic", "glmnet")]))
+results <- workflows |>
+  workflow_map("tune_grid", resamples = folds, grid = 6, seed = 42,
+               metrics = metric_set(accuracy, roc_auc, brier_class),
+               control = control_grid(save_pred = TRUE, save_workflow = TRUE))
+rank_results(results, rank_metric = "roc_auc", select_best = TRUE) |>
+  select(wflow_id, .metric, mean, std_err, rank) |>
+  pivot_wider(names_from = .metric, values_from = c(mean, std_err))
+```
+
+```{r}
+#| label: workflow-set-plot
+autoplot(results, rank_metric = "roc_auc", metric = c("accuracy", "roc_auc"), select_best = TRUE)
+```
+
+**Conclusion** With the ROC AUC, the tuned $k$-NN comes first ($0.83$), followed by the perceptron, the naive Bayes, and the logistic and penalized logistic regressions with quadratic features (around $0.81$–$0.82$). The linear methods (logistic, LDA, penalized logistic) and the tree are around $0.79$, and the QDA comes last ($0.78$). The rankings by accuracy and by AUC differ (the quadratic logistic regressions have the best accuracies, $0.78$). All the differences are of the order of the standard errors ($0.01$–$0.02$): with $156$ training observations, many methods are statistically indistinguishable.
+
+---
+
+**Question** The differences between the best workflows are small. Compare the two best ones with their *paired* differences of ROC AUC on the $15$ resamples (their best configurations are evaluated on the same folds). Then finalize the best workflow, fit it on the whole training set and evaluate it once on the test set with `last_fit()`. Plot its decision map.
+
+**Answer**
+
+```{r}
+#| label: paired
+best_two <- rank_results(results, rank_metric = "roc_auc", select_best = TRUE) |>
+  filter(.metric == "roc_auc") |> slice_head(n = 2) |> pull(wflow_id)
+per_fold <- map_dfr(best_two, function(id) {
+  result <- extract_workflow_set_result(results, id)
+  collect_metrics(result, summarize = FALSE) |>
+    filter(.metric == "roc_auc", .config == select_best(result, metric = "roc_auc")$.config) |>
+    transmute(id, id2, wflow_id = !!id, .estimate)
+})
+differences <- per_fold |> pivot_wider(names_from = wflow_id, values_from = .estimate) |>
+  mutate(difference = .data[[best_two[1]]] - .data[[best_two[2]]])
+c(mean = mean(differences$difference), sd = sd(differences$difference),
+  `positive differences` = sum(differences$difference > 0), resamples = nrow(differences))
+```
+
+```{r}
+#| label: last-fit
+best_result <- extract_workflow_set_result(results, best_two[1])
+final <- extract_workflow(results, best_two[1]) |>
+  finalize_workflow(select_best(best_result, metric = "roc_auc")) |>
+  last_fit(split, metrics = metric_set(accuracy, roc_auc, brier_class))
+collect_metrics(final)
+```
+
+```{r}
+#| label: last-fit-map
+final_fit <- extract_workflow(final)
+grid_tc <- expand_grid(PredictorA = seq(0, 0.8, length.out = 150), PredictorB = seq(0, 0.7, length.out = 150))
+grid_tc |> bind_cols(predict(final_fit, grid_tc, type = "prob")) |>
+  ggplot(aes(PredictorA, PredictorB)) + geom_raster(aes(fill = .pred_Class1), alpha = 0.6) +
+  geom_contour(aes(z = .pred_Class1), breaks = 0.5, color = "black") +
+  geom_point(data = two_class, aes(color = classes)) +
+  scale_fill_gradient2(low = "#2a78d6", mid = "white", high = "#eb6834", midpoint = 0.5) +
+  scale_color_manual(values = c(Class1 = "#eb6834", Class2 = "#2a78d6")) + coord_equal(expand = FALSE)
+```
+
+**Conclusion** The paired differences of AUC between the two best workflows ($k$-NN and perceptron) have a mean of $0.008$ and a standard deviation of $0.053$, and only $8$ of the $15$ are positive: the two are indistinguishable. The test set gives an accuracy of $0.72$ and an AUC of $0.76$ for the $k$-NN, *below* its CV estimate ($0.83$). Part of the gap is the optimism of the selection (the best of $11$ workflows tuned on the same folds, see Lab 1), and part is the variability of a test set of only $52$ observations (the standard error of an accuracy is then about $0.06$).
+
+---
+
+**Question** Which phenomena of parts 2 to 4 (misspecification, flexibility, bias–variance trade-off) explain the ranking on TwoClass?
+
+**Answer** The boundary of TwoClass is curved, so the linear methods (logistic, LDA, linear penalized logistic) are misspecified: as on the simulated problem, they keep an approximation error and lose against the flexible methods (tuned $k$-NN, perceptron) and against the quadratic features. The QDA has the right *form* of boundary but estimates two covariance matrices with few observations, and its Gaussian assumption is wrong for these skewed predictors: it pays in variance and bias. The tuned $k$-NN wins by choosing its bias–variance trade-off with the cross validation, but with $156$ observations the estimation error and the variability of the estimates (Part 4) are large enough to blur the ranking: several methods are equivalent, and the simplest one, the logistic regression with quadratic features, is a sensible choice.
+
+---
+
+## To go further
+
+The following blocks are optional and independent: each of them only uses the objects defined in the core part. Their difficulty is marked by stars: ★ direct extension, ★★ new method, ★★★ longer or research-flavored.
+
+| Block | Lecture | Stars |
+|---|---|---|
+| Generative versus discriminative learning curves | Generative modeling, logistic | ★★ |
+| The optimism of least squares (PC2, Exercise 3) | Risk estimation, linear regression | ★★ |
+| Regularization paths | Regularization | ★ |
+| Kernel trick and random features | SVM | ★★ |
+| Double descent | Deep learning, overparametrization | ★★★ |
+| The width of a perceptron | Neural networks | ★★ |
+| AutoML in R: racing and stacking | AutoML (Lecture 1) | ★★ |
+| AutoML in R: Bayesian optimization over learners with mlr3 | AutoML (Lecture 1) | ★★ |
+| Error estimation schemes: ESL Figure 7.1 | Risk estimation (Lecture 1) | ★★ |
+| Local regression: LOESS | Local averaging | ★ |
+| The variability of cross validation | Risk estimation | ★ |
+
+### Generative versus discriminative learning curves (★★)
+
+Ng and Jordan (2001) compared a generative classifier and its discriminative counterpart: when its assumptions hold, the generative model can achieve lower risk at a given sample size; when it is wrong, it converges to a worse rule, and the discriminative one wins for large $n$. LDA and the (linear) logistic regression are such a pair: both give a linear rule (PC2, *Linear discriminant analysis is a linear classifier*), LDA by modeling $P(X \mid Y)$ (Gaussian classes with the same covariance), the logistic regression by modeling $P(Y \mid X)$ directly (linear log-odds). We compare them in dimension $d = 20$ on two problems where $\eta$ is known:
+
+- (a) Gaussian classes with the same covariance: both models are right;
+- (b) independent exponential features, $X_j \mid Y = k \sim \mathcal{E}(\lambda_{kj})$: the log-odds
+
+  $$\log\frac{P(Y = 2 \mid x)}{P(Y = 1 \mid x)} = \sum_j \left(\log\frac{\lambda_{2j}}{\lambda_{1j}} - (\lambda_{2j} - \lambda_{1j})\, x_j\right)$$
+
+  are linear (the logistic model is right), but the classes are not Gaussian (LDA is wrong).
+
+**Question** Simulate both problems, and compute the excess risk of the LDA and of the logistic regression for $n \in \{30, 50, 100, 200, 500, 1000, 5000, 20000\}$ (averaged over $20$ repetitions, on a test sample of $20\,000$ points). Plot the learning curves in log-log scale.
+
+**Answer**
+
+```{r}
+#| label: ng-jordan
+#| tags: [going-further]
+d <- 20
+features <- paste0("x", 1:d)
+as_class <- function(y) factor(if_else(y == 0, "Class1", "Class2"), levels = c("Class1", "Class2"))
+# (a) LDA is right: Gaussian classes with the same (correlated) covariance
+Sigma_d <- 0.5^abs(outer(1:d, 1:d, "-"))
+delta <- c(1, -0.5, 0.5, rep(0, d - 3))
+simulate_gauss <- function(n) {
+  y <- rbinom(n, 1, 0.5)
+  x <- rmvnorm(n, rep(0, d), Sigma_d) + outer(y, delta)
+  log_odds <- drop((x - 0.5 * outer(rep(1, n), delta)) %*% solve(Sigma_d, delta))  # log P(Class2 | x) / P(Class1 | x)
+  as_tibble(x, .name_repair = ~ features) |> mutate(class = as_class(y), eta = plogis(-log_odds))
+}
+# (b) only the logistic model is right: independent exponential features, with rates rate1 (Class1) and rate2 (Class2)
+rate1 <- rep(1, d)
+rate2 <- c(8, 1.5, 0.5, 0.25, rep(1, d - 4))
+simulate_expo <- function(n) {
+  y <- rbinom(n, 1, 0.5)
+  x <- sapply(1:d, function(j) rexp(n, if_else(y == 1, rate2[j], rate1[j])))
+  log_odds <- drop(sum(log(rate2 / rate1)) - x %*% (rate2 - rate1))               # linear in x
+  as_tibble(x, .name_repair = ~ features) |> mutate(class = as_class(y), eta = plogis(-log_odds))
+}
+simulators <- list(`(a) LDA is right` = simulate_gauss, `(b) only the logistic model is right` = simulate_expo)
+set.seed(5)
+tests <- map(simulators, \(simulate_problem) simulate_problem(20000))
+curves <- expand_grid(problem = names(simulators), n = c(30, 50, 100, 200, 500, 1000, 5000, 20000), rep = 1:20) |>
+  mutate(excess = pmap(list(problem, n), function(problem, n) {
+    data <- simulators[[problem]](n) |> select(-eta)
+    map_dbl(list(LDA = discrim_linear(), logistic = logistic_reg()), function(spec)
+      excess_risk(predict(fit_method(class ~ ., spec, data), tests[[problem]])$.pred_class, tests[[problem]]))
+  })) |>
+  unnest_wider(excess) |> pivot_longer(c(LDA, logistic), names_to = "method", values_to = "excess")
+learning_curves <- curves |> group_by(problem, n, method) |> summarise(excess = mean(excess), .groups = "drop")
+learning_curves |> pivot_wider(names_from = method, values_from = excess) |> print(n = Inf)
+ggplot(learning_curves, aes(n, excess, color = method)) + geom_line() + geom_point() +
+  facet_wrap(~ problem, scales = "free_y") + scale_x_log10() + scale_y_log10() + labs(y = "excess risk")
+```
+
+**Conclusion** When LDA is right (a), the curves are consistent with the same rate (about $1/n$, a straight line of slope $-1$ in log-log scale), but LDA is ahead for small samples ($0.097$ against $0.129$ for $n = 50$, $0.050$ against $0.064$ for $n = 100$): its stronger assumptions act as a regularization, while the logistic regression needs more observations to estimate its $21$ parameters (for $n \leq 50$, the classes are often separable and its fit diverges). When only the logistic model is right (b), the two methods are equivalent for $n \leq 50$; then the logistic regression keeps converging to the Bayes rule ($0.0003$ for $n = 20\,000$), while LDA converges to the best rule *of its model*, a wrong linear rule: its excess risk levels off around $0.02$. This is the picture of Ng and Jordan: a generative model gains when its assumptions are right, and pays an asymptotic bias when they are wrong, while the discriminative model only assumes what it needs (the form of the log-odds).
+
+---
+
+### The optimism of least squares (★★)
+
+PC2 (Exercise 3) compares the error of the least squares estimator in the fixed design, repeated fixed design and random design settings. For a well specified Gaussian linear model $Y = X^\top\beta + \varepsilon$ with $X \sim \mathcal{N}(0, I_d)$, the expected training error is $\sigma^2(1 - d/n)$, the repeated fixed design error is $\sigma^2(1 + d/n)$ (the optimism is $2\sigma^2 d/n$, as in Mallows' $C_p$), and the random design error is $\sigma^2(1 + d/(n - d - 1))$.
+
+**Question** For $n = 100$, $\sigma = 1$ and $d \in \{5, 10, 20, 40, 60, 80, 95\}$, estimate the three errors by Monte Carlo ($200$ repetitions) and compare them with the formulas. What happens when $d$ approaches $n$?
+
+**Answer**
+
+```{r}
+#| label: optimism
+#| tags: [going-further]
+set.seed(6)
+optimism <- map_dfr(c(5, 10, 20, 40, 60, 80, 95), function(d) {
+  map_dfr(1:200, function(r) {
+    n <- 100
+    beta <- rnorm(d)
+    X <- matrix(rnorm(n * d), n, d); y <- X %*% beta + rnorm(n)
+    beta_hat <- qr.solve(X, y)
+    y_new <- X %*% beta + rnorm(n)                                    # same design, new noise
+    X_new <- matrix(rnorm(n * d), n, d); y_random <- X_new %*% beta + rnorm(n)
+    tibble(d = d, training = mean((y - X %*% beta_hat)^2), `repeated fixed design` = mean((y_new - X %*% beta_hat)^2),
+           `random design` = mean((y_random - X_new %*% beta_hat)^2))
+  })
+}) |> group_by(d) |> summarise(across(everything(), mean)) |>
+  mutate(`formula: training` = 1 - d / 100, `formula: fixed` = 1 + d / 100, `formula: random` = 1 + d / (100 - d - 1))
+optimism
+```
+
+**Conclusion** The Monte Carlo estimates match the formulas: the training error is $\sigma^2(1 - d/n)$ ($0.80$ for $d = 20$), the repeated fixed design error $\sigma^2(1 + d/n)$ ($1.21$), so that the optimism $2\sigma^2 d/n$ is exactly the $C_p$ correction of Lecture 1. The random design error is larger, $\sigma^2(1 + d/(n - d - 1))$ ($1.25$ for $d = 20$): the new point $X$ is not one of the design points, and the estimation error is amplified in the directions poorly covered by the design. When $d$ approaches $n$, the training error tends to $0$ (interpolation), the fixed design error to $2\sigma^2$, and the random design error explodes ($24.6$ for $d = 95$): this is the peak of the double descent below.
+
+---
+
+### Regularization paths (★)
+
+The penalized logistic regression minimizes the negative log-likelihood plus $\lambda\left((1-\alpha)\|\beta\|_2^2/2 + \alpha\|\beta\|_1\right)$: ridge for $\alpha = 0$, lasso for $\alpha = 1$. The *regularization path* shows the coefficients as functions of $\lambda$; the lasso sets some of them exactly to $0$.
+
+**Question** On TwoClass with polynomial features of degree $5$ (normalized), plot the ridge and lasso paths with `glmnet`, choose $\lambda$ by cross validation with `cv.glmnet` (minimum and *one standard error* rule), and count the non-zero coefficients of the lasso.
+
+**Answer**
+
+```{r}
+#| label: paths
+#| tags: [going-further]
+library(glmnet)
+prepared <- recipe(classes ~ ., data = train_tc) |> step_normalize(all_predictors()) |>
+  step_poly(all_predictors(), degree = 5) |> step_interact(~ starts_with("PredictorA"):starts_with("PredictorB")) |>
+  prep() |> bake(new_data = NULL)
+x_poly <- as.matrix(select(prepared, -classes)); y_tc <- prepared$classes
+par(mfrow = c(1, 2))
+plot(glmnet(x_poly, y_tc, family = "binomial", alpha = 0, lambda.min.ratio = 1e-3), xvar = "lambda", main = "ridge")
+plot(glmnet(x_poly, y_tc, family = "binomial", alpha = 1, lambda.min.ratio = 1e-3), xvar = "lambda", main = "lasso")
+set.seed(7)
+cv_lasso <- cv.glmnet(x_poly, y_tc, family = "binomial", alpha = 1, type.measure = "deviance")
+c(lambda_min = cv_lasso$lambda.min, lambda_1se = cv_lasso$lambda.1se,
+  nonzero_min = sum(coef(cv_lasso, s = "lambda.min") != 0) - 1, nonzero_1se = sum(coef(cv_lasso, s = "lambda.1se") != 0) - 1,
+  features = ncol(x_poly))
+```
+
+**Conclusion** The ridge coefficients shrink smoothly towards $0$ as $\lambda$ increases, all of them remaining non-zero; the lasso coefficients leave $0$ one after the other, so that the path also selects the features. The cross validation of the deviance selects $\lambda = 0.039$ with $8$ non-zero coefficients out of $35$, and the one standard error rule a slightly larger penalty ($0.057$) with $7$: the polynomial and interaction terms of high degree are not needed, as the true boundary is quadratic.
+
+---
+
+### Kernel trick and random features (★★)
+
+A kernel SVM never computes the features: it only uses the kernel $k(x, x') = \exp(-\gamma\|x - x'\|^2)$ between pairs of points, at a cost which grows like $n^2$. *Random Fourier features* (Rahimi and Recht, 2007) approximate this kernel with explicit features $z(x) = \sqrt{2/D}\cos(Wx + b)$, with $W \sim \mathcal{N}(0, 2\gamma I)$ and $b \sim \mathcal{U}[0, 2\pi]$: $z(x)^\top z(x') \approx k(x, x')$.
+
+**Question** On our simulated problem ($n = 2000$), compare the excess risk and the fitting time of an RBF SVM (`kernlab`, $\gamma = 0.5$) with a logistic regression on $D \in \{2, 10, 50, 200\}$ random features, with a small ridge penalty (`glmnet`, penalty $10^{-3}$, `mixture = 0`; without any penalty, near separation can produce large finite coefficients. Complete or quasi-complete separation can prevent a finite optimum). Check also the approximation of the kernel.
+
+**Answer**
+
+```{r}
+#| label: random-features
+#| tags: [going-further]
+set.seed(8)
+data <- simulate(2000)
+gamma <- 0.5
+random_features <- function(D) {
+  W <- matrix(rnorm(2 * D, sd = sqrt(2 * gamma)), 2, D); b <- runif(D, 0, 2 * pi)
+  function(d) { z <- sqrt(2 / D) * cos(cbind(d$x1, d$x2) %*% W + rep(b, each = nrow(d))); colnames(z) <- paste0("z", 1:D); as_tibble(z) }
+}
+timing <- function(expr) system.time(expr)[["elapsed"]]
+svm_time <- timing(svm_fit <- fit(workflow(class ~ x1 + x2, svm_rbf(rbf_sigma = gamma) |> set_mode("classification")), data))
+comparison <- tibble(method = "RBF SVM", D = NA, `excess risk` = excess_risk(predict(svm_fit, test)$.pred_class, test), time = svm_time)
+for (D in c(2, 10, 50, 200)) {
+  z <- random_features(D)
+  time_D <- timing(rf_fit <- fit(logistic_reg(penalty = 1e-3, mixture = 0) |> set_engine("glmnet"), class ~ ., data = bind_cols(z(data), class = data$class)))
+  comparison <- bind_rows(comparison, tibble(method = "logistic on random features", D = D,
+    `excess risk` = excess_risk(predict(rf_fit, z(test))$.pred_class, test), time = time_D))
+}
+comparison
+z <- random_features(2000)
+pairs <- data |> slice_head(n = 200)
+zz <- as.matrix(z(pairs))
+approximation <- tibble(kernel = as.vector(exp(-gamma * as.matrix(dist(cbind(pairs$x1, pairs$x2)))^2)),
+                        `random features` = as.vector(zz %*% t(zz)))
+ggplot(approximation |> slice_sample(n = 5000), aes(kernel, `random features`)) + geom_point(alpha = 0.2) + geom_abline(color = "red")
+```
+
+**Conclusion** With $D = 2$ random features, the logistic regression is far from the kernel method (excess risk $0.12$); with $D = 50$ it is already as good as the exact RBF SVM ($0.002$ against $0.004$), and with $D = 200$ slightly better ($0.0007$), while its fitting time grows linearly with $n$ (the SVM takes a few seconds here, and its cost grows at least quadratically). The scatter plot shows that $z(x)^\top z(x')$ approximates the Gaussian kernel with an error of order $1/\sqrt{D}$. A small ridge penalty is needed: without it, the logistic regression on many features can yield large coefficients near separation and divergent coefficients under separation, which is the explicit counterpart of the regularization of the SVM.
+
+---
+
+### Double descent (★★★)
+
+In a linear regression on $D$ random features, the least squares fit interpolates the data as soon as $D \geq n$. Among all the interpolating solutions, the *minimum norm* one (given by the pseudo-inverse) behaves surprisingly well: its test error, which explodes when $D \approx n$ (as the random design error of the previous blocks), decreases again for $D \gg n$. This *double descent* is one of the clues to understand overparametrized neural networks.
+
+**Question** Regress $y = \sin(2\,a^\top x) + \varepsilon$ ($x \sim \mathcal{N}(0, I_{10})$, a fixed random direction $a$ of norm about $1$, $\sigma = 0.3$, $n = 100$) on $D$ random ReLU features $\max(0, w^\top x + b)$ ($w \sim \mathcal{N}(0, I/10)$, $b \sim \mathcal{N}(0, 1)$), with the minimum norm least squares solution, for $D$ from $5$ to $3000$. Plot the squared error against the noiseless regression function as a function of $D$ (median of $20$ repetitions, log scales).
+
+**Answer**
+
+```{r}
+#| label: double-descent
+#| tags: [going-further]
+set.seed(9)
+n <- 100; d <- 10
+a <- rnorm(d) / sqrt(d)
+target <- function(X) sin(2 * X %*% a)
+double_descent <- expand_grid(D = unique(round(10^seq(log10(5), log10(3000), length.out = 22))), rep = 1:20) |>
+  mutate(error = map_dbl(D, function(D) {
+    X <- matrix(rnorm(n * d), n, d); y <- target(X) + rnorm(n, sd = 0.3)
+    X_test <- matrix(rnorm(1000 * d), 1000, d)
+    W <- matrix(rnorm(d * D), d, D) / sqrt(d); b <- rnorm(D)
+    features <- function(X) pmax(X %*% W + rep(b, each = nrow(X)), 0)
+    beta <- MASS::ginv(features(X)) %*% y                  # minimum norm least squares
+    mean((features(X_test) %*% beta - target(X_test))^2)
+  }))
+double_descent |> group_by(D) |> summarise(error = median(error)) |>
+  ggplot(aes(D, error)) + geom_line() + geom_point() + geom_vline(xintercept = n, linetype = "dashed") +
+  scale_x_log10() + scale_y_log10() + labs(y = "excess squared prediction risk (median of 20 repetitions)")
+double_descent |> group_by(D) |> summarise(error = median(error)) |> filter(D %in% c(23, 105, 3000) | error == min(error))
+```
+
+**Conclusion** Test MSE against fresh noisy responses adds $0.09$ to the expected error against the regression function. The latter first follows the classical U shape: it decreases until about $D = 23$ features ($0.34$), then increases as the model starts to fit the noise. It explodes at the *interpolation threshold* $D = n = 100$ ($18$, more than $50$ times the minimum): there is exactly one interpolating solution, and it is very unstable (the design matrix is badly conditioned, as in the random design formula $d/(n - d - 1)$ of the optimism block). Beyond it, among the many interpolating solutions, the minimum norm one becomes smoother as $D$ grows, and the error decreases again ($0.40$ for $D = 3000$), close to the best underparametrized model. This second descent is one of the explanations of the good generalization of overparametrized networks, whose training (gradient descent from a small initialization) implicitly favors small norm solutions.
+
+---
+
+### The width of a perceptron (★★)
+
+The universal approximation theorem says that a perceptron with one hidden layer can approximate any continuous function, provided its hidden layer is large enough. In practice, the width interacts with the training (epochs, penalty).
+
+**Question** Fit `mlp()` (`brulee`, $200$ epochs, penalty $10^{-3}$) with $1, 2, 4, 8, 16, 32$ hidden units on our simulated problem ($n = 500$), and plot the excess risk and the decision maps for $1$, $4$ and $32$ units.
+
+**Answer**
+
+```{r}
+#| label: mlp-width
+#| tags: [going-further]
+set.seed(10)
+data <- simulate(500)
+width <- tibble(units = c(1, 2, 4, 8, 16, 32)) |>
+  mutate(fitted = map(units, \(u) fit_method(class ~ x1 + x2, mlp(hidden_units = u, penalty = 1e-3, epochs = 200) |>
+                                                set_engine("brulee") |> set_mode("classification"), data)),
+         excess = map_dbl(fitted, \(f) excess_risk(predict(f, test)$.pred_class, test)))
+width |> select(units, excess)
+wrap_plots(map(c(1, 3, 6), \(i) decision_map(width$fitted[[i]], data, paste(width$units[i], "hidden units"))), guides = "collect")
+```
+
+**Conclusion** With $1$ hidden unit, the perceptron is a logistic regression on a single linear combination: its boundary is a line and its excess risk ($0.11$) is high. A few units are enough to bend the boundary along the Bayes boundary: the excess risk is $0.007$ with $4$ units and $0.002$ with $8$. With $16$ and $32$ units, it increases again ($0.009$ and $0.023$): with the same penalty and number of epochs, the larger network fits the noise of the $500$ training points (its boundary bends in the regions without data). Universal approximation says what a wide network *can* represent; what it learns from finite data depends on the regularization (penalty, early stopping), which must be tuned with the width.
+
+---
+
+### AutoML in R: racing and stacking (★★)
+
+An AutoML system automates what we did by hand in Part 5. Two of its ingredients are available in `tidymodels`: *racing* (`finetune`), which stops evaluating the configurations that are clearly worse after a few resamples (a form of successive halving), and *stacking* (`stacks`), which learns a penalized combination of the out-of-fold predictions of many candidates (as AutoGluon does).
+
+**Question** Run the workflow set of Part 5 with `tune_race_anova()` (grid of $10$), compare the number of model fits with the grid search, and build a stacked ensemble of all the candidates with `stacks`. Evaluate it on the test set.
+
+**Answer**
+
+```{r}
+#| label: racing-stacking
+#| tags: [going-further]
+library(finetune)
+library(stacks)
+racing <- workflows |>
+  workflow_map("tune_race_anova", resamples = folds, grid = 10, seed = 42,
+               metrics = metric_set(roc_auc, accuracy),
+               control = control_race(save_pred = TRUE, save_workflow = TRUE))
+fits_race <- sum(map_int(racing$result, \(r) nrow(collect_metrics(r, summarize = FALSE) |> filter(.metric == "roc_auc"))))
+fits_grid <- sum(map_int(results$result, \(r) nrow(collect_metrics(r, summarize = FALSE) |> filter(.metric == "roc_auc"))))
+c(`resample fits (racing, grid of 10)` = fits_race, `resample fits (grid search, grid of 6)` = fits_grid)
+ensemble <- stacks() |> add_candidates(racing) |> blend_predictions() |> fit_members()
+autoplot(ensemble, type = "weights")
+predict(ensemble, test_tc, type = "prob") |> bind_cols(test_tc) |>
+  bind_cols(predict(ensemble, test_tc)) |>
+  (\(p) bind_rows(roc_auc(p, classes, .pred_Class1), accuracy(p, classes, .pred_class)))()
+```
+
+**Conclusion** The racing evaluates a grid of $10$ configurations per workflow with $510$ resample fits, fewer than the $615$ of the grid search with $6$ configurations: the configurations that are clearly worse after the first resamples are dropped. The stacked ensemble reaches a test AUC of $0.80$ and an accuracy of $0.755$, better than the single best workflow of Part 5 on the test set ($0.76$ and $0.72$), but the test set is small and its noise (see the last block) is of the same order as these differences. Racing and stacking are the main ingredients of AutoML systems such as AutoGluon: the search budget is spent on the promising candidates, and the final model combines several of them instead of betting on one.
+
+---
+
+### AutoML in R: Bayesian optimization over learners with mlr3 (★★)
+
+`mlr3` is another framework for machine learning in R, with a different vocabulary: a *task* holds the data, a *learner* is a model, a *graph* chains preprocessing and learners, a *tuner* searches the hyperparameters. An AutoML system can be built from its pieces: a graph with a *branch* that selects one learner among several, and a search space in which the hyperparameters of each learner only exist when its branch is selected. A Bayesian optimization (`mlr3mbo`) then chooses the learner and its hyperparameters jointly. (The `mlr3automl` package packages this idea with a larger portfolio, but it needs a Redis server to distribute the search.)
+
+**Question** Build a graph that scales the features and branches between `glmnet`, `kknn`, `ranger` and an RBF `svm`, define the joint search space, and tune it with `tnr("mbo")` ($30$ evaluations, $5$-fold CV of the AUC) on the training part of TwoClass. Which learners were tried, which one is selected, and how does its test AUC compare with the best workflow of Part 5?
+
+**Answer**
+
+```{r}
+#| label: mlr3-automl
+#| tags: [going-further]
+library(mlr3)
+library(mlr3learners)
+library(mlr3pipelines)
+library(mlr3tuning)
+library(mlr3mbo)
+lgr::get_logger("mlr3")$set_threshold("warn")
+lgr::get_logger("bbotk")$set_threshold("warn")
+task <- as_task_classif(as.data.frame(train_tc), target = "classes", positive = "Class1")
+learners <- list(lrn("classif.glmnet", predict_type = "prob"), lrn("classif.kknn", predict_type = "prob"),
+                 lrn("classif.ranger", predict_type = "prob"),
+                 lrn("classif.svm", predict_type = "prob", type = "C-classification", kernel = "radial"))
+ids <- map_chr(learners, \(l) l$id)
+graph <- po("scale") %>>% po("branch", options = ids) %>>% gunion(map(learners, po)) %>>% po("unbranch", options = ids)
+search_space <- ps(
+  branch.selection = p_fct(ids),
+  classif.glmnet.lambda = p_dbl(1e-4, 1, logscale = TRUE, depends = branch.selection == "classif.glmnet"),
+  classif.glmnet.alpha = p_dbl(0, 1, depends = branch.selection == "classif.glmnet"),
+  classif.kknn.k = p_int(1, 60, depends = branch.selection == "classif.kknn"),
+  classif.ranger.min.node.size = p_int(1, 30, depends = branch.selection == "classif.ranger"),
+  classif.svm.cost = p_dbl(1e-2, 1e2, logscale = TRUE, depends = branch.selection == "classif.svm"),
+  classif.svm.gamma = p_dbl(1e-2, 1e2, logscale = TRUE, depends = branch.selection == "classif.svm"))
+set.seed(14)
+# mlr3tuning::tune, not the tune() placeholder of tidymodels, which has the same name
+instance <- mlr3tuning::tune(tuner = tnr("mbo"), task = task, learner = as_learner(graph), resampling = rsmp("cv", folds = 5),
+                             measures = msr("classif.auc"), search_space = search_space, term_evals = 30)
+as.data.table(instance$archive)[, .(evaluations = .N, `best CV AUC` = max(classif.auc)), by = branch.selection]
+```
+
+```{r}
+#| label: mlr3-automl-test
+#| tags: [going-further]
+final_learner <- as_learner(graph)
+final_learner$param_set$set_values(.values = instance$result_learner_param_vals)
+final_learner$train(task)
+final_learner$predict_newdata(as.data.frame(test_tc))$score(msrs(c("classif.auc", "classif.acc")))
+```
+
+**Conclusion** The Bayesian optimization spends its $30$ evaluations unequally: $10$ on the $k$-NN, $8$ on the SVM and $6$ each on `glmnet` and the random forest, as the surrogate model learns which branches are promising. The best configuration is a $k$-NN (CV AUC $0.835$, the random forest being very close at $0.834$), the same family as the best workflow of Part 5, with a test AUC of $0.81$ and an accuracy of $0.755$. The two frameworks reach the same conclusion with different tools; `mlr3` makes the joint search over learners and hyperparameters explicit, which is what AutoML systems automate.
+
+---
+
+### Error estimation schemes: ESL Figure 7.1 (★★)
+
+Figure 7.1 of *The Elements of Statistical Learning* shows the training error and the test error of the lasso along its path, for many training sets. We reproduce it on a sparse linear model, and compare the estimates of the test error given by $V$-fold cross validation, the .632 bootstrap and Mallows' $C_p$ (lecture 1).
+
+**Question** For the model $Y = X^\top\beta + \varepsilon$ with $d = 35$ correlated Gaussian features ($\Sigma_{ij} = 0.5^{|i-j|}$), $\beta = (1, \dots, 1, 0, \dots, 0)$ ($15$ ones), $\sigma = 2.5$ and $n = 50$, plot the training and test errors of the lasso as functions of $\lambda$ for $20$ training sets. Then, for one training set, compare the $10$-fold CV, .632 bootstrap ($100$ draws) and $C_p$ estimates of the test error along the path.
+
+**Answer**
+
+```{r}
+#| label: esl-71
+#| tags: [going-further]
+library(glmnet)
+d <- 35; k <- 15; sigma <- 2.5
+beta <- c(rep(1, k), rep(0, d - k))
+Cov <- 0.5^abs(outer(1:d, 1:d, "-"))
+gen_sample <- function(n) { X <- matrix(rnorm(n * d), n, d) %*% chol(Cov); list(X = X, y = drop(X %*% beta + sigma * rnorm(n))) }
+lambda <- 10^seq(log10(5), log10(0.001), length.out = 50)
+mse <- function(fit, data) colMeans((predict(fit, data$X, s = lambda) - data$y)^2)
+set.seed(11)
+big_test <- gen_sample(10000)
+paths <- map_dfr(1:20, function(r) {
+  train_l <- gen_sample(50)
+  fit <- glmnet(train_l$X, train_l$y, lambda = lambda)
+  tibble(rep = r, lambda = lambda, training = mse(fit, train_l), test = mse(fit, big_test))
+})
+paths |> pivot_longer(c(training, test), names_to = "error") |>
+  ggplot(aes(lambda, value, color = error, group = interaction(rep, error))) + geom_line(alpha = 0.3) +
+  stat_summary(aes(group = error), fun = mean, geom = "line", linewidth = 1.2) + scale_x_log10()
+```
+
+```{r}
+#| label: esl-71-estimates
+#| tags: [going-further]
+set.seed(12)
+train_l <- gen_sample(50)
+fit <- glmnet(train_l$X, train_l$y, lambda = lambda)
+folds_l <- sample(rep(1:10, length.out = 50))
+cv_error <- rowMeans(sapply(1:10, function(v) {
+  fit_v <- glmnet(train_l$X[folds_l != v, ], train_l$y[folds_l != v], lambda = lambda)
+  colMeans((predict(fit_v, train_l$X[folds_l == v, , drop = FALSE], s = lambda) - train_l$y[folds_l == v])^2)
+}))
+oob <- rowMeans(sapply(1:100, function(b) {
+  idx <- sample(50, replace = TRUE); out <- setdiff(1:50, idx)
+  fit_b <- glmnet(train_l$X[idx, ], train_l$y[idx], lambda = lambda)
+  colMeans((predict(fit_b, train_l$X[out, , drop = FALSE], s = lambda) - train_l$y[out])^2)
+}))
+training <- mse(fit, train_l)
+df <- predict(fit, s = lambda, type = "nonzero") |> map_int(length)
+estimates <- tibble(lambda = lambda, `test (truth)` = mse(fit, big_test), `10-fold CV` = cv_error,
+                    `.632 bootstrap` = 0.368 * training + 0.632 * oob, `C_p` = training + 2 * df * sigma^2 / 50)
+estimates |> pivot_longer(-lambda, names_to = "estimate") |>
+  ggplot(aes(lambda, value, color = estimate)) + geom_line() + scale_x_log10()
+estimates |> pivot_longer(-lambda, names_to = "estimate") |> group_by(estimate) |> slice_min(value, n = 1) |>
+  select(estimate, `selected lambda` = lambda, `estimated error` = value)
+```
+
+**Conclusion** As in ESL's Figure 7.1, the training error decreases steadily when $\lambda$ decreases, while the test error has a U shape with a large variability from one training set to another ($n = 50$). For the training set studied, the test error is minimal for $\lambda = 0.092$ ($9.25$). The $10$-fold CV and $C_p$ select $\lambda = 0.22$ and the .632 bootstrap $\lambda = 0.092$: all choose a $\lambda$ in the flat bottom of the curve, which is what matters. Their *values*, however, underestimate the test error of this fit ($5.1$ to $6.2$ against $9.25$, below even $\sigma^2 = 6.25$): with $50$ observations, this training set happens to be easier than average, and all the estimates computed from it share this luck. Estimates of the risk are good for *choosing* a model, much less for *predicting* its performance.
+
+---
+
+### Local regression: LOESS (★)
+
+LOESS fits, around each point, a weighted linear (or quadratic) regression on its nearest neighbors; the fraction of points used (`span`) plays the role of $k$ in the $k$-NN.
+
+**Question** On $y = \sin(4x) + \varepsilon$ ($\sigma = 0.3$, $n = 100$), plot the LOESS fits for spans $0.1$, $0.3$ and $0.9$, and choose the span by leave-one-out cross validation.
+
+**Answer**
+
+```{r}
+#| label: loess
+#| tags: [going-further]
+set.seed(13)
+toy <- tibble(x = runif(100), y = sin(4 * x) + rnorm(100, sd = 0.3))
+spans <- c(0.1, 0.3, 0.9)
+map_dfr(spans, \(s) tibble(span = factor(s), x = seq(0.02, 0.98, length.out = 200),
+                            fit = predict(loess(y ~ x, data = toy, span = s), tibble(x = x)))) |>
+  ggplot(aes(x, fit, color = span)) + geom_line(linewidth = 1) + geom_point(data = toy, aes(x, y), inherit.aes = FALSE, alpha = 0.4) +
+  geom_function(fun = \(x) sin(4 * x), linetype = "dashed", inherit.aes = FALSE)
+loo <- map_dfr(seq(0.1, 1, by = 0.05), function(s) {
+  errors <- map_dbl(seq_len(nrow(toy)), \(i) toy$y[i] - predict(loess(y ~ x, data = toy[-i, ], span = s,
+                                                                    control = loess.control(surface = "direct")), toy[i, ]))
+  tibble(span = s, `LOO error` = mean(errors^2, na.rm = TRUE))
+})
+loo |> slice_min(`LOO error`)
+```
+
+**Conclusion** The span plays the role of $k$ in the $k$-NN: with $0.1$, the fit follows the noise (high variance); with $0.9$, it is very smooth and slightly flattens the extremes (bias). The leave-one-out cross validation selects a span of $0.25$, with a LOO error of $0.082$, close to the noise variance $\sigma^2 = 0.09$: the remaining error is almost only the irreducible one.
+
+---
+
+### The variability of cross validation (★)
+
+**Question** Repeat a $10$-fold cross validation of the logistic regression on the training part of TwoClass with $50$ different random splits. How variable is the estimated accuracy? Compare with the differences between the workflows of Part 5.
+
+**Answer**
+
+```{r}
+#| label: cv-variability
+#| tags: [going-further]
+cv_estimates <- map_dbl(1:50, function(seed) {
+  set.seed(seed)
+  fit_resamples(workflow(base_recipe, logistic_reg()), vfold_cv(train_tc, v = 10, strata = classes),
+                metrics = metric_set(accuracy)) |> collect_metrics() |> pull(mean)
+})
+c(mean = mean(cv_estimates), sd = sd(cv_estimates), min = min(cv_estimates), max = max(cv_estimates))
+ggplot(tibble(accuracy = cv_estimates), aes(accuracy)) + geom_histogram(bins = 15)
+```
+
+**Conclusion** Only by changing the random split into folds, the $10$-fold CV accuracy of the same model on the same data varies between $0.715$ and $0.762$ (standard deviation $0.009$). This spread is larger than many differences between the workflows of Part 5 (whose CV accuracies range from $0.71$ to $0.78$, with many within $0.01$ of each other): the ranking of close workflows is partly random, and a repeated cross validation with paired comparisons is needed before claiming that one is better.
+
+---
+
+## About this lab
+
+**Use of AI.** Artificial intelligence tools have been used to revise the content of this lab. The main contributor takes full responsibility for this content.
+
+**License.** The texts of this lab are under the [Creative Commons Attribution-ShareAlike 4.0](https://creativecommons.org/licenses/by-sa/4.0/) license (CC BY-SA 4.0), and its code under the [MIT](https://opensource.org/license/mit) license; the datasets keep their own licenses. Main contributor: E. Le Pennec. Contributors: S. Boucheron, A. Dieuleveut, A.K. Fermin, S. Gadat, S. Gaiffas, B. Goujaud, A. Guilloux, Ch. Keribin, Th. Klein, E. Matzner, J. Read, M. Sangnier, E. Scornet.

@@ -502,7 +502,7 @@ plot_samples(list(data = moons))
 
 A VAE (PC4, *EM and the ELBO*) has a latent variable $z \sim \mathcal{N}(0, I)$ and a decoder $x | z \sim \mathcal{N}(g_\theta(z), \sigma^2 I)$. As the posterior of $z$ is intractable, an *encoder* $q_\phi(z|x) = \mathcal{N}(\mu_\phi(x), \text{diag}(s^2_\phi(x)))$ is trained jointly to maximize the ELBO $\mathbb{E}_{q_\phi}[\log p_\theta(x|z)] - \text{KL}(q_\phi(\cdot|x), \mathcal{N}(0, I))$, with the *reparametrization* $z = \mu_\phi(x) + s_\phi(x)\epsilon$, $\epsilon \sim \mathcal{N}(0, I)$, so that the gradient goes through the sampling.
 
-**Question** Train a VAE with a 2D latent space on the two moons ($\sigma = 0.1$, $3000$ steps of Adam on mini-batches of $256$), and sample new points by decoding $z \sim \mathcal{N}(0, I)$. Then train one on the digits (latent dimension $2$, pixels scaled to $[0, 1]$) and decode a grid of codes.
+**Question** Train a VAE with a 2D latent space on the two moons ($\sigma = 0.1$, $3000$ steps of Adam on mini-batches of $256$), and sample new points by adding independent decoder noise to the means obtained by decoding $z \sim \mathcal{N}(0, I)$. Then train one on the digits (latent dimension $2$, pixels scaled to $[0, 1]$) and decode a grid of codes.
 
 **Answer**
 
@@ -514,7 +514,7 @@ A VAE (PC4, *EM and the ELBO*) has a latent variable $z \sim \mathcal{N}(0, I)$ 
 
 ### Langevin sampling (★★)
 
-If the *score* $\nabla_x \log p(x)$ of a density is known, the Langevin dynamics $x_{t+1} = x_t + \frac{\eta}{2}\nabla\log p(x_t) + \sqrt{\eta}\,\xi_t$ ($\xi_t \sim \mathcal{N}(0, I)$) samples from $p$ for small steps and long runs. Score-based models learn the score; here we use the exact score of the mixture of $10$ Gaussians fitted above. With isolated modes, the dynamics hardly jumps between them: *annealing* (starting with a smoothed density) helps.
+If the *score* $\nabla_x \log p(x)$ of a density is known, the Langevin dynamics $x_{t+1} = x_t + \frac{\eta}{2}\nabla\log p(x_t) + \sqrt{\eta}\,\xi_t$ ($\xi_t \sim \mathcal{N}(0, I)$) approximates $p$ for small steps and sufficiently long runs. For a standard normal target the stationary variance is $1/(1-\eta/4)$ when $0<\eta<4$, so a longer run still has fixed-step bias. Score-based models learn the score; here we use the exact score of the mixture of $10$ Gaussians fitted above. With isolated modes, the dynamics hardly jumps between them: *annealing* (starting with a smoothed density) helps.
 
 **Question** Implement the Langevin dynamics with the score of the Gaussian mixture `gmm10`, starting from $2000$ points uniform in $[-2.5, 2.5]^2$, with $\eta = 0.01$ and $500$ steps. Then start all the points from the same point $(-1.2, 0.5)$ (on the left moon): do the samples reach the right moon?
 

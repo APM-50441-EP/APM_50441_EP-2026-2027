@@ -388,11 +388,16 @@ The concepts are the same in Python: `polars` and `duckdb` are fast engines for 
 
 ```python
 import polars as pl, duckdb
-flights = pl.scan_parquet("data/flights_parquet/**/*.parquet")            # lazy, like open_dataset
-by_airline = flights.group_by("AIRLINE").agg(pl.col("ARRIVAL_DELAY").mean()).collect()
-duckdb.sql("SELECT AIRLINE, AVG(ARRIVAL_DELAY) FROM 'data/flights_parquet/**/*.parquet' GROUP BY AIRLINE")
+flights = pl.scan_parquet("data/flights_parquet/**/*.parquet")
+by_airline = (flights.group_by("AIRLINE")
+              .agg(pl.col("ARRIVAL_DELAY").mean()).collect())
+duckdb.sql("""SELECT AIRLINE, AVG(ARRIVAL_DELAY)
+              FROM 'data/flights_parquet/**/*.parquet'
+              GROUP BY AIRLINE""")
 from joblib import Parallel, delayed
-errors = Parallel(n_jobs=4)(delayed(cv_rmse)(formula, fold) for formula in formulas for fold in range(8))
+jobs = (delayed(cv_rmse)(formula, fold)
+        for formula in formulas for fold in range(8))
+errors = Parallel(n_jobs=4)(jobs)
 from fastapi import FastAPI
 app = FastAPI()
 @app.get("/predict")

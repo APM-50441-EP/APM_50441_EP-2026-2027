@@ -1,0 +1,1149 @@
+---
+title: "APM_50441_EP - Machine Learning 2 - Lab 4: Unsupervised learning, dimension reduction, clustering and generative models"
+format:
+  html:
+    toc: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+This lab illustrates the fourth lecture (*Unsupervised Learning, Generative Learning and More*). Its goals are:
+
+- to see the *curse of dimensionality* numerically (PC4),
+- to compute a principal component analysis and to understand it as a reconstruction method,
+- to compare nonlinear dimension reduction methods (MDS, Isomap, t-SNE, UMAP) on the digits and on a Swiss roll,
+- to compare clustering methods (k-means, Gaussian mixtures, DBSCAN, agglomerative clustering) and to choose the number of groups,
+- to generate new digits with a Gaussian mixture, and to train an autoencoder with `{torch}`.
+
+The optional *To go further* part, after the core, can be skipped at first: it covers the rest of the lecture, in particular the generative models (VAE, flows, diffusion and flow matching, GAN).
+
+::: {.no-handout}
+We use `R` with `tidyverse`.
+
+**Working environment.** Colab is the simplest option: open the notebook version of this lab (`APM_50441_EP_Lab_4.ipynb`, *Open in Colab* link) with the R runtime, and run its first cell, which installs the packages. To work on your own computer, download the lab folder (the `.qmd` file and its files) or clone the course repository, open the `.qmd` file in RStudio or Positron (or VS Code with the R extension), and run it chunk by chunk or render it with Quarto. The packages are installed once with the script `PC/env/install_packages.R` (`source("install_packages.R")`, then `install_lab("lab4")`); `{torch}` downloads its own library the first time (`torch::install_torch()`, done by `install_lab`). The data are read from the local files when they are present (otherwise they are downloaded).
+
+**Use of AI.** AI assistants are allowed, but you must be able to explain every line you use, and you should answer the *predict before you run* questions before running the code: the suggested code may not be correct!
+:::
+
+```{r}
+#| label: setup
+#| tags: [keep]
+library(cluster)
+library(igraph)
+library(dbscan)
+library(mclust)
+library(Rtsne)
+library(uwot)
+library(torch)
+library(patchwork)
+library(tidyverse)   # loaded last, so that purrr::map is not masked by mclust::map
+theme_set(theme_light())
+if (!file.exists("data/digits.csv")) {
+  dir.create("data", showWarnings = FALSE)
+  download.file("https://raw.githubusercontent.com/APM-50441-EP/APM_50441_EP-2026-2027/main/PC4/data/digits.csv", "data/digits.csv")
+}
+digits <- read_csv("data/digits.csv", show_col_types = FALSE)
+pixels <- as.matrix(select(digits, -label))
+labels <- factor(digits$label)
+dim(pixels)
+```
+
+## 1. The curse of dimensionality
+
+PC4 shows that, for $n$ points uniform in $[0,1]^d$, the norms and the pairwise distances concentrate: $\|X\|/\sqrt{d} \to \sqrt{1/3}$ and $\|X - X'\|/\sqrt{d} \to \sqrt{1/6}$, and the ratio between the largest and the smallest distances tends to $1$ as long as $\log(n)/d \to 0$.
+
+**Question** *Predict before you run:* for $250$ points uniform in $[0,1]^d$, what happens to the ratio between the largest and the smallest pairwise distances when $d$ grows? Compute, for $d \in \{2, 10, 100, 500, 1000\}$, the minimum, the maximum and the ratio of the distances to the origin and of the pairwise distances (with `dist()`), divided by $\sqrt{d}$.
+
+**Answer**
+
+```{r}
+#| label: curse
+set.seed(42)
+curse <- map_dfr(c(2, 10, 100, 500, 1000), function(d) {
+  X <- matrix(runif(250 * d), 250, d)
+  norms <- sqrt(rowSums(X^2)) / sqrt(d)
+  pairwise <- as.vector(dist(X)) / sqrt(d)
+  tibble(d = d, `min norm` = min(norms), `max norm` = max(norms), `ratio norms` = max(norms) / min(norms),
+         `min distance` = min(pairwise), `max distance` = max(pairwise), `ratio distances` = max(pairwise) / min(pairwise))
+})
+curse
+c(`sqrt(1/3)` = sqrt(1 / 3), `sqrt(1/6)` = sqrt(1 / 6))
+```
+
+**Conclusion** In dimension $2$, the distances between the points vary a lot: the largest pairwise distance is $300$ times the smallest one. When $d$ grows, the norms divided by $\sqrt d$ concentrate around $\sqrt{1/3} \approx 0.577$ (between $0.554$ and $0.595$ for $d = 1000$) and the pairwise distances around $\sqrt{1/6} \approx 0.408$ (between $0.373$ and $0.439$): the ratio between the largest and the smallest distances tends to $1$ ($1.18$ for $d = 1000$). In high dimension, all the points are almost equally far from each other: the "nearest" neighbor is hardly nearer than the others (PC4).
+
+---
+
+**Question** In $[0,1]^d$, a cube that contains a fraction $r$ of the data (uniform) has a side $r^{1/d}$. Plot this side for $r = 1\%$ and $r = 10\%$ as a function of $d \in [1, 100]$. What does it mean for a "local" method such as the $k$-nearest neighbors?
+
+**Answer**
+
+```{r}
+#| label: neighborhood
+expand_grid(d = 1:100, r = c(0.01, 0.1)) |>
+  mutate(side = r^(1 / d), r = scales::percent(r)) |>
+  ggplot(aes(d, side, color = r)) + geom_line(linewidth = 1) + labs(y = "side of the cube", color = "fraction of the data")
+```
+
+**Conclusion** In dimension $1$, $1\%$ of the data is in an interval of length $0.01$; in dimension $10$, a cube containing $1\%$ of the data has a side of $0.63$, and in dimension $100$ of $0.955$: it spans almost the whole range of each feature. A "local" method such as the $k$-NN is then not local any more: either its neighborhoods are large (bias) or they contain very few points (variance). Real data, such as the digits, escape this curse because they lie near a structure of much lower dimension than their ambient space.
+
+---
+
+**Question** Random projections do not suffer from the dimension: by the Johnson–Lindenstrauss lemma, projecting $n$ points on $k = O(\log(n)/\varepsilon^2)$ random directions preserves all their pairwise distances up to a factor $1 \pm \varepsilon$. Project $250$ Gaussian points of dimension $1000$ on $k \in \{10, 50, 200\}$ random Gaussian directions (scaled by $1/\sqrt{k}$), and plot the distribution of the ratios between the projected and the original pairwise distances.
+
+**Answer**
+
+```{r}
+#| label: random-projection
+set.seed(1)
+X <- matrix(rnorm(250 * 1000), 250, 1000)
+original <- as.vector(dist(X))
+projections <- map_dfr(c(10, 50, 200), function(k) {
+  W <- matrix(rnorm(1000 * k), 1000, k) / sqrt(k)
+  tibble(k = factor(k), ratio = as.vector(dist(X %*% W)) / original)
+})
+projections |> group_by(k) |> summarise(`1% quantile` = quantile(ratio, 0.01), median = median(ratio), `99% quantile` = quantile(ratio, 0.99))
+ggplot(projections, aes(ratio, fill = k)) + geom_density(alpha = 0.4)
+```
+
+**Conclusion** The ratios between the projected and the original distances concentrate around $1$ as $k$ grows: $98\%$ of them are between $0.50$ and $1.49$ for $k = 10$, between $0.77$ and $1.24$ for $k = 50$ and between $0.88$ and $1.12$ for $k = 200$. The width decreases like $1/\sqrt k$ and does not depend on the original dimension ($1000$): this is the Johnson–Lindenstrauss lemma, $k = O(\log(n)/\varepsilon^2)$ random directions preserve all the pairwise distances of $n$ points within a factor $1 \pm \varepsilon$. Random projections are a cheap first reduction, useful before a $k$-NN search for instance.
+
+---
+
+## 2. Principal component analysis of the digits
+
+The digits are $8 \times 8$ grayscale images (values from $0$ to $16$): $1797$ observations in dimension $64$. A PCA looks for the linear subspace of dimension $q$ that keeps the largest inertia, or equivalently that reconstructs the data with the smallest error (PC4); it is computed by a singular value decomposition of the centered data matrix.
+
+**Question** Compute the PCA of the digits with `prcomp` (without scaling), and check that its scores are the left singular vectors of the centered matrix multiplied by the singular values (`svd`), and that classical multidimensional scaling (`cmdscale`) of the Euclidean distances gives the same coordinates (up to signs). Plot the proportion of explained variance and the first two scores colored by the digit.
+
+**Answer**
+
+```{r}
+#| label: pca
+pca <- prcomp(pixels)
+centered <- scale(pixels, scale = FALSE)
+s <- svd(centered)
+mds <- cmdscale(dist(pixels), k = 2)
+c(`max |prcomp - svd|` = max(abs(abs(pca$x[, 1:5]) - abs(s$u[, 1:5] %*% diag(s$d[1:5])))),
+  `max |prcomp - cmdscale|` = max(abs(abs(pca$x[, 1:2]) - abs(mds))))
+explained <- tibble(component = 1:64, proportion = pca$sdev^2 / sum(pca$sdev^2), cumulative = cumsum(proportion))
+explained |> filter(component %in% c(2, 5, 10, 20, 30))
+(ggplot(explained, aes(component, cumulative)) + geom_line() + geom_point(size = 0.8) + labs(y = "cumulative explained variance")) +
+  (ggplot(tibble(PC1 = pca$x[, 1], PC2 = pca$x[, 2], digit = labels), aes(PC1, PC2, color = digit)) + geom_point(size = 0.6))
+```
+
+**Conclusion** The scores of `prcomp` are those of the SVD of the centered matrix, and classical MDS on the Euclidean distances gives the same coordinates, up to signs (differences of order $10^{-12}$): PCA, the SVD and classical MDS are the same method. The first two components explain only $28.5\%$ of the variance, $10$ components $74\%$ and $30$ components $96\%$. On the first plane, some digits form separate groups ($0$, $4$, $6$) while others overlap: a linear projection on $2$ dimensions keeps too little information to separate the $10$ classes.
+
+---
+
+**Question** Plot the mean digit and the first $6$ principal directions as $8\times 8$ images ("eigen-digits"). Then plot the reconstruction of the first $5$ digits with $q \in \{2, 5, 10, 20\}$ components, and the mean reconstruction error as a function of $q$. Relate this error to the explained variance.
+
+**Answer**
+
+```{r}
+#| label: eigen-digits
+image_tiles <- function(vectors, titles, nrow = 1) {
+  map2_dfr(seq_len(nrow(vectors)), titles, \(i, t) tibble(title = t, row = rep(1:8, each = 8), col = rep(1:8, 8), value = vectors[i, ])) |>
+    mutate(title = factor(title, levels = unique(titles))) |>
+    ggplot(aes(col, -row, fill = value)) + geom_raster() + facet_wrap(~ title, nrow = nrow) +
+    scale_fill_gradient2() + coord_equal() + theme_void() + theme(legend.position = "none")
+}
+tiles <- rbind(pca$center, t(pca$rotation[, 1:6]))
+image_tiles(tiles / apply(abs(tiles), 1, max), c("mean", paste0("PC", 1:6)))   # each image on its own scale
+```
+
+```{r}
+#| label: reconstruction
+reconstruct <- function(q) sweep(pca$x[, 1:q, drop = FALSE] %*% t(pca$rotation[, 1:q, drop = FALSE]), 2, pca$center, "+")
+map(c(2, 5, 10, 20), \(q) image_tiles(reconstruct(q)[1:5, ], paste0("digit ", 1:5, ", q = ", q))) |> wrap_plots(ncol = 1)
+errors <- tibble(q = 1:40, `mean squared error` = map_dbl(q, \(q) mean(rowSums((pixels - reconstruct(q))^2))),
+                 `sum of the remaining eigenvalues` = map_dbl(q, \(q) sum(pca$sdev[(q + 1):64]^2) * (nrow(pixels) - 1) / nrow(pixels)))
+errors |> filter(q %in% c(2, 5, 10, 20))
+```
+
+**Conclusion** The mean digit is a blurred average shape, and the principal directions (each image on its own color scale) are contrasts between regions of the image, with positive and negative pixels: adding or subtracting them moves strokes. With $q = 2$ components, all the reconstructions look alike; with $q = 10$, the digits become recognizable; with $q = 20$, they are close to the original images. The mean squared reconstruction error equals the sum of the eigenvalues of the discarded components ($859$ for $q = 2$, $127$ for $q = 20$): the PCA is the best linear reconstruction of rank $q$ (Eckart–Young, PC4), and the proportion of explained variance is $1$ minus the relative reconstruction error.
+
+---
+
+## 3. Nonlinear dimension reduction
+
+A PCA can only find linear structures. On a *Swiss roll*, a 2D sheet rolled in 3D, the interesting coordinate is the position along the roll, which is not linear. *Isomap* replaces the Euclidean distances by *geodesic* distances (shortest paths in a neighborhood graph) and applies MDS to them; *t-SNE* and *UMAP* preserve the neighborhoods rather than the distances.
+
+```{r}
+#| label: swiss-roll
+#| tags: [keep]
+set.seed(3)
+t_roll <- 1.5 * pi * (1 + 2 * runif(1500))
+swiss <- cbind(t_roll * cos(t_roll), 20 * runif(1500), t_roll * sin(t_roll))
+```
+
+**Question** Implement Isomap: build the graph of the $10$ nearest neighbors (`dbscan::kNN`), compute the shortest path distances (`igraph::distances`) and apply `cmdscale`. Compare the PCA and the Isomap embeddings of the Swiss roll, colored by the position along the roll `t_roll`.
+
+**Answer**
+
+```{r}
+#| label: isomap
+isomap <- function(X, k = 10, dim = 2) {
+  neighbors <- kNN(X, k = k)
+  edges <- tibble(from = rep(seq_len(nrow(X)), k), to = as.vector(neighbors$id), weight = as.vector(neighbors$dist))
+  graph <- graph_from_data_frame(edges, directed = FALSE, vertices = tibble(id = seq_len(nrow(X))))
+  cmdscale(distances(graph), k = dim)
+}
+swiss_embeddings <- bind_rows(
+  tibble(method = "PCA", as_tibble(prcomp(swiss)$x[, 1:2], .name_repair = ~ c("x", "y")), t = t_roll),
+  tibble(method = "Isomap", as_tibble(isomap(swiss), .name_repair = ~ c("x", "y")), t = t_roll))
+ggplot(swiss_embeddings, aes(x, y, color = t)) + geom_point(size = 0.5) + facet_wrap(~ method, scales = "free") + scale_color_viridis_c()
+```
+
+**Conclusion** The PCA of the Swiss roll only shows the roll seen from the side: the points with very different positions along the roll ($t$) are projected close to each other. Isomap unrolls it: its first coordinate follows $t$ almost monotonically, because the geodesic distances along the neighborhood graph measure the distances *along* the surface, not through the ambient space.
+
+---
+
+To compare embeddings, we use the proportion of the $10$ nearest neighbors of each point (in the original space) that are still among its $10$ nearest neighbors in the embedding:
+
+```{r}
+#| label: knn-preservation
+#| tags: [keep]
+knn_preservation <- function(X, embedding, k = 10) {
+  original <- kNN(X, k = k)$id
+  embedded <- kNN(embedding, k = k)$id
+  mean(map_dbl(seq_len(nrow(X)), \(i) length(intersect(original[i, ], embedded[i, ])) / k))
+}
+```
+
+**Question** Embed the digits in 2D with PCA, Isomap, t-SNE (`Rtsne`, on the first $50$ principal components, perplexity $30$) and UMAP (`uwot::umap`). Plot the embeddings colored by the digit, and compare their neighbor preservation. Then try the perplexities $5$ and $100$ for t-SNE.
+
+**Answer**
+
+```{r}
+#| label: digits-embeddings
+set.seed(4)
+pcs50 <- pca$x[, 1:50]
+embeddings <- list(PCA = pca$x[, 1:2], Isomap = isomap(pixels),
+                   `t-SNE (perplexity 30)` = Rtsne(pcs50, perplexity = 30, pca = FALSE)$Y,
+                   UMAP = umap(pixels, n_neighbors = 15, min_dist = 0.1))
+imap_dfr(embeddings, \(e, name) tibble(method = name, x = e[, 1], y = e[, 2], digit = labels)) |>
+  mutate(method = factor(method, levels = names(embeddings))) |>
+  ggplot(aes(x, y, color = digit)) + geom_point(size = 0.4) + facet_wrap(~ method, scales = "free") +
+  guides(color = guide_legend(override.aes = list(size = 3)))
+```
+
+```{r}
+#| label: digits-preservation
+embeddings[["t-SNE (perplexity 5)"]] <- Rtsne(pcs50, perplexity = 5, pca = FALSE)$Y
+embeddings[["t-SNE (perplexity 100)"]] <- Rtsne(pcs50, perplexity = 100, pca = FALSE)$Y
+tibble(method = names(embeddings), `10-NN preservation` = map_dbl(embeddings, \(e) knn_preservation(pixels, e)))
+```
+
+**Conclusion** t-SNE and UMAP separate the $10$ digits into well-defined clusters, while the PCA and Isomap show overlapping clouds (Isomap separates some digits, such as $0$, $4$ and $6$). The neighbor preservation measures it: only $12\%$ of the $10$ nearest neighbors are kept by the PCA and $18\%$ by Isomap, against $59\%$ by t-SNE and $50\%$ by UMAP. t-SNE and UMAP are designed to preserve the neighborhoods, at the price of the global distances (the distances between clusters and their sizes in the maps are not meaningful). The perplexity changes the balance: $5$ and $100$ give a slightly lower neighbor preservation ($0.54$ and $0.53$) than $30$.
+
+---
+
+## 4. Clustering
+
+We compare the clustering methods of the lecture on three toy datasets with known groups, and on the digits. The agreement between a clustering and the true groups is measured with the *adjusted Rand index* (ARI): the proportion of pairs of points on which the two partitions agree (both in the same group, or both in different groups), corrected so that a random partition gets $0$ on average and identical partitions get $1$ (`mclust::adjustedRandIndex`).
+
+```{r}
+#| label: toy-data
+#| tags: [keep]
+set.seed(5)
+toy <- list(
+  blobs = tibble(x = c(rnorm(200, 0), rnorm(200, 4), rnorm(200, 2)), y = c(rnorm(200, 0), rnorm(200, 0), rnorm(200, 3.5)), group = rep(1:3, each = 200)),
+  elongated = tibble(x = c(rnorm(300, 0, 3), rnorm(300, 0, 3)), y = c(rnorm(300, 0, 0.3), rnorm(300, 2, 0.3)), group = rep(1:2, each = 300)),
+  rings = tibble(angle = runif(600, 0, 2 * pi), radius = rep(c(1, 3), each = 300) + rnorm(600, 0, 0.15), group = rep(1:2, each = 300)) |>
+    transmute(x = radius * cos(angle), y = radius * sin(angle), group))
+bind_rows(toy, .id = "dataset") |> ggplot(aes(x, y, color = factor(group))) + geom_point(size = 0.5) +
+  facet_wrap(~ dataset, scales = "free") + theme(aspect.ratio = 1) + labs(color = "group")
+```
+
+**Question** On each toy dataset, run $k$-means (`nstart = 20`), a Gaussian mixture (`Mclust`, with the true number of groups), DBSCAN (`dbscan`, $\varepsilon = 0.5$, `minPts = 10`; its noise points form a group of their own) and agglomerative clustering with the single, average and Ward linkages (`hclust` + `cutree`, true number of groups). Report the ARI of each method. Which assumptions explain the results?
+
+**Answer**
+
+```{r}
+#| label: toy-clustering
+clusterings <- function(data) {
+  X <- as.matrix(select(data, x, y)); K <- n_distinct(data$group); D <- dist(X)
+  list(`k-means` = kmeans(X, K, nstart = 20)$cluster, `Gaussian mixture` = Mclust(X, G = K, verbose = FALSE)$classification,
+       DBSCAN = dbscan(X, eps = 0.5, minPts = 10)$cluster, `single linkage` = cutree(hclust(D, "single"), K),
+       `average linkage` = cutree(hclust(D, "average"), K), Ward = cutree(hclust(D, "ward.D2"), K))
+}
+toy_results <- imap_dfr(toy, \(data, name) imap_dfr(clusterings(data), \(cl, method) tibble(dataset = name, method = method,
+                                                                                            ARI = adjustedRandIndex(cl, data$group))))
+toy_results |> pivot_wider(names_from = dataset, values_from = ARI)
+```
+
+**Conclusion** Each method succeeds where its assumptions hold. On the blobs (compact and roughly spherical groups), $k$-means and the Gaussian mixture find the groups (ARI $0.90$), Ward and the average linkage almost as well, while the single linkage fails (it chains the touching groups). On the elongated groups, only the Gaussian mixture, which models the covariances, is perfect; DBSCAN finds them ($0.79$, the remaining errors being points labeled as noise). On the rings, only the methods based on connectivity (DBSCAN, single linkage) succeed, as the groups are neither compact nor convex. There is no universal clustering: the notion of group is part of the method.
+
+---
+
+**Question** On the first $10$ principal components of the digits, choose the number of groups $K \in \{2, \dots, 15\}$ with the *elbow* of the within-cluster inertia of $k$-means, the average *silhouette* of $k$-means, and the BIC of Gaussian mixtures with diagonal covariances (`Mclust(..., modelNames = "VVI")`). Compare the chosen numbers with the $10$ digits, and the ARI of the clusterings with the labels.
+
+**Answer**
+
+```{r}
+#| label: choose-k
+pcs10 <- pca$x[, 1:10]
+set.seed(6)
+D10 <- dist(pcs10)
+choice <- map_dfr(2:15, function(K) {
+  km <- kmeans(pcs10, K, nstart = 10)
+  tibble(K = K, inertia = km$tot.withinss, silhouette = mean(silhouette(km$cluster, D10)[, 3]), ARI = adjustedRandIndex(km$cluster, labels))
+})
+bic <- Mclust(pcs10, G = 2:15, modelNames = "VVI", verbose = FALSE)
+choice <- choice |> mutate(BIC = as.vector(bic$BIC[as.character(2:15), "VVI"]))
+choice |> pivot_longer(-K) |> ggplot(aes(K, value)) + geom_line() + geom_point() + facet_wrap(~ name, scales = "free_y")
+c(`best silhouette` = choice$K[which.max(choice$silhouette)], `best BIC` = bic$G,
+  `ARI of k-means with K = 10` = choice$ARI[choice$K == 10], `ARI of the mixture with K = 10` =
+    adjustedRandIndex(Mclust(pcs10, G = 10, modelNames = "VVI", verbose = FALSE)$classification, labels))
+```
+
+**Conclusion** The inertia decreases with $K$ without a clear elbow; the silhouette is maximal for $K = 9$, close to the $10$ digits, and the BIC of the diagonal Gaussian mixtures keeps increasing up to $K = 15$ (the largest value tried): the clusters of digits are not Gaussian, and the mixture uses several components per digit. With $K = 10$, $k$-means agrees reasonably with the labels (ARI $0.65$), better than the mixture ($0.53$). The "right" number of clusters depends on the criterion, and the classes of a supervised problem are only one of the possible structures.
+
+---
+
+## 5. A first generative model: Gaussian mixtures
+
+A density model can be used to *generate* new data: a Gaussian mixture is sampled by drawing a component, then a Gaussian vector. In dimension $64$, the covariances of a mixture are hard to estimate, so we fit the mixture on the first principal components and map the samples back to the pixels.
+
+**Question** Fit a Gaussian mixture with $12$ components and full covariances (`Mclust(..., G = 12, modelNames = "VVV")`) on the first $15$ principal components of the digits, draw $30$ new points with `mclust::sim`, map them back to the pixel space and plot them. Compare with a mixture on $5$ components only.
+
+**Answer**
+
+```{r}
+#| label: gmm-sampling
+set.seed(7)
+generate <- function(q, n = 30) {
+  fit <- Mclust(pca$x[, 1:q], G = 12, modelNames = "VVV", verbose = FALSE)
+  samples <- sim(fit$modelName, fit$parameters, n = n)[, -1]
+  pmin(pmax(sweep(samples %*% t(pca$rotation[, 1:q]), 2, pca$center, "+"), 0), 16)
+}
+(image_tiles(generate(15)[1:12, ], as.character(1:12)) + ggtitle("mixture on 15 principal components")) /
+  (image_tiles(generate(5)[1:12, ], as.character(1:12)) + ggtitle("mixture on 5 principal components"))
+```
+
+**Conclusion** The samples of the Gaussian mixture on $15$ principal components look like plausible, slightly blurred digits, of various classes: a simple generative model already captures much of the variability of the digits. With only $5$ principal components, the samples are blurrier and some are ambiguous: the model can only generate what lies in its $5$-dimensional subspace. The quality of a generative model depends both on its density model and on the representation in which it is fitted.
+
+---
+
+## 6. Autoencoders with `{torch}`
+
+An autoencoder is a neural network trained to reconstruct its input through a low-dimensional *code*: an encoder $x \mapsto z$ and a decoder $z \mapsto \hat x$, trained to minimize $\|x - \hat x\|^2$. With linear layers and the squared loss, the best autoencoder spans the same subspace as the PCA; nonlinear layers can find curved structures.
+
+```{r}
+#| label: torch-setup
+#| tags: [keep]
+torch_set_num_threads(2)                            # small networks: a few threads are faster than many
+X_scaled <- scale(pixels, scale = FALSE) / 16       # centered, in [-1, 1]
+x_tensor <- torch_tensor(X_scaled, dtype = torch_float())
+train_autoencoder <- function(encoder, decoder, epochs = 1500, lr = 1e-2, seed = 0) {
+  torch_manual_seed(seed)
+  parameters <- c(encoder$parameters, decoder$parameters)
+  optimizer <- optim_adam(parameters, lr = lr)
+  losses <- numeric(epochs)
+  for (epoch in seq_len(epochs)) {
+    optimizer$zero_grad()
+    loss <- nnf_mse_loss(decoder(encoder(x_tensor)), x_tensor)
+    loss$backward()
+    optimizer$step()
+    losses[epoch] <- loss$item()
+  }
+  losses
+}
+```
+
+**Question** Train a *linear* autoencoder $64 \to 2 \to 64$ (`nn_linear` layers, full batch, Adam, $1500$ epochs), and compare its reconstruction error with the PCA with $2$ components. Check that the subspace spanned by the decoder weights is the one of the first two principal directions, by computing the cosines of the *principal angles* between the two subspaces (the singular values of $Q_1^\top Q_2$, where $Q_1$ and $Q_2$ are orthonormal bases).
+
+**Answer**
+
+```{r}
+#| label: linear-ae
+torch_manual_seed(0)
+encoder <- nn_linear(64, 2)
+decoder <- nn_linear(2, 64)
+losses <- train_autoencoder(encoder, decoder)
+decoder_weights <- as.matrix(decoder$weight)   # 64 x 2
+cosines <- svd(t(qr.Q(qr(decoder_weights))) %*% pca$rotation[, 1:2])$d
+c(`linear autoencoder MSE` = tail(losses, 1),
+  `PCA (q = 2) MSE` = mean((X_scaled - (X_scaled %*% pca$rotation[, 1:2]) %*% t(pca$rotation[, 1:2]))^2),
+  `cosine of the principal angles` = cosines)
+```
+
+**Conclusion** The linear autoencoder reaches exactly the reconstruction error of the PCA with $2$ components ($0.0524$), and the cosines of the principal angles between the subspace of its decoder and the first principal plane are $1$: it has found the same subspace (with another basis, since the loss only depends on the subspace). A linear autoencoder trained by gradient descent is a (slow) way to compute a PCA.
+
+---
+
+**Question** Train a deep autoencoder $64 \to 128 \to 32 \to 2 \to 32 \to 128 \to 64$ with `tanh` activations. Compare its reconstruction error with the linear one, and plot the 2D codes of both, colored by the digit.
+
+**Answer**
+
+```{r}
+#| label: deep-ae
+torch_manual_seed(0)
+deep_encoder <- nn_sequential(nn_linear(64, 128), nn_tanh(), nn_linear(128, 32), nn_tanh(), nn_linear(32, 2))
+deep_decoder <- nn_sequential(nn_linear(2, 32), nn_tanh(), nn_linear(32, 128), nn_tanh(), nn_linear(128, 64))
+deep_losses <- train_autoencoder(deep_encoder, deep_decoder, epochs = 2000, lr = 5e-3)
+c(`deep autoencoder MSE` = tail(deep_losses, 1), `linear autoencoder MSE` = tail(losses, 1))
+codes <- bind_rows(tibble(model = "linear", as_tibble(as.matrix(encoder(x_tensor)), .name_repair = ~ c("z1", "z2")), digit = labels),
+                   tibble(model = "deep", as_tibble(as.matrix(deep_encoder(x_tensor)), .name_repair = ~ c("z1", "z2")), digit = labels))
+ggplot(codes, aes(z1, z2, color = digit)) + geom_point(size = 0.4) + facet_wrap(~ model, scales = "free") +
+  guides(color = guide_legend(override.aes = list(size = 3)))
+```
+
+**Conclusion** With nonlinear layers, the reconstruction error with a $2$-dimensional code is three times smaller ($0.018$ against $0.052$): the code can follow a curved structure. The codes of the deep autoencoder separate the digits much better than the linear ones, each digit occupying a branch of a star-shaped map. The autoencoder is a nonlinear dimension reduction, and its decoder a generator of images (but not a probabilistic one: see the VAE).
+
+---
+
+## To go further
+
+The following blocks are optional and independent: each of them only uses the objects defined in the core part. Their difficulty is marked by stars: ★ direct extension, ★★ new method, ★★★ longer or research-flavored.
+
+| Block | Lecture | Stars |
+|---|---|---|
+| Semi-supervised learning: label propagation | More than supervised or unsupervised | ★★ |
+| Pairwise comparisons: the Bradley–Terry model | Comparison learning | ★★ |
+| Structured data: blocked cross validation | Structured learning | ★ |
+| Classification metrics: ROC and precision-recall | Metrics | ★ |
+| Multiple correspondence analysis | Dimension reduction (MFA/MCA) | ★★ |
+| ICA and NMF | Dimension reduction | ★★ |
+| Kernel PCA and Laplacian eigenmaps | Dimension reduction | ★★ |
+| Stability and parameters of t-SNE and UMAP | Comparing methods | ★★ |
+| k-medoids and HDBSCAN | Clustering | ★ |
+| Spectral clustering | Clustering | ★★ |
+| EM for Gaussian mixtures | Model-based clustering (PC4) | ★★ |
+| Two moons, a toy generative problem | Generative modeling | ★ |
+| A variational autoencoder | Latent variables, ELBO | ★★ |
+| Langevin sampling | Energy-based models, score | ★★ |
+| A normalizing flow: Real NVP | Flows | ★★ |
+| Flow matching | Diffusion and flow matching | ★★ |
+| Guidance | Diffusion and flow matching | ★★ |
+| A generative adversarial network | GAN | ★★ |
+| An autoregressive model of the digits | Factorization, sequences | ★★ |
+| Comparing generative models | Generative modeling | ★★★ |
+
+### Semi-supervised learning: label propagation (★★)
+
+When only a few labels are known, the unlabeled points can still help: *label propagation* spreads the known labels along a neighborhood graph, assuming that close points share their label.
+
+**Question** Keep the labels of $20$ random digits only ($2$ per class). Propagate them on the graph of the $10$ nearest neighbors (in the space of the first $30$ principal components): iterate $F \leftarrow \alpha S F + (1-\alpha) Y$, where $S$ is the symmetrically normalized adjacency matrix, $Y$ the one-hot matrix of the known labels and $\alpha = 0.9$. Compare the accuracy on the unlabeled digits with a $1$-NN classifier trained on the $20$ labeled digits.
+
+**Answer**
+
+```{r}
+#| label: label-propagation
+#| tags: [going-further]
+set.seed(8)
+pcs30 <- pca$x[, 1:30]
+known <- unlist(map(levels(labels), \(l) sample(which(labels == l), 2)))
+nn <- kNN(pcs30, k = 10)
+A <- Matrix::sparseMatrix(i = rep(seq_len(nrow(pcs30)), 10), j = as.vector(nn$id), x = 1, dims = c(nrow(pcs30), nrow(pcs30)))
+A <- A + Matrix::t(A); A@x[] <- 1
+degree <- Matrix::rowSums(A)
+S <- Matrix::Diagonal(x = 1 / sqrt(degree)) %*% A %*% Matrix::Diagonal(x = 1 / sqrt(degree))
+Y <- matrix(0, nrow(pcs30), 10); Y[cbind(known, as.integer(labels[known]))] <- 1
+F_ <- Y
+for (iteration in 1:50) F_ <- as.matrix(0.9 * (S %*% F_) + 0.1 * Y)
+propagated <- levels(labels)[max.col(F_)]
+one_nn <- labels[known][kNN(pcs30[known, ], k = 1, query = pcs30)$id[, 1]]
+unlabeled <- setdiff(seq_len(nrow(pcs30)), known)
+c(`label propagation` = mean(propagated[unlabeled] == labels[unlabeled]), `1-NN on 20 labels` = mean(one_nn[unlabeled] == labels[unlabeled]))
+```
+
+**Conclusion** With only $2$ labeled digits per class, the label propagation classifies $94\%$ of the other $1777$ digits correctly, against $76\%$ for the $1$-NN using the $20$ labeled digits only. The unlabeled digits reveal the structure of the classes (their clusters in the neighborhood graph), and the labels spread along it: the semi-supervised assumption (close points on the graph share their label) holds very well here.
+
+---
+
+### Pairwise comparisons: the Bradley–Terry model (★★)
+
+In *comparison learning*, the data are comparisons ("$i$ beats $j$") rather than labels. The Bradley–Terry model assumes $\mathbb{P}(i \succ j) = \sigma(\theta_i - \theta_j)$: it is a logistic regression whose features are $+1$ for $i$, $-1$ for $j$ and $0$ elsewhere. It is used to rank players, products, or the answers of language models (RLHF, Lecture 6).
+
+**Question** Simulate $10$ players with strengths $\theta$ drawn from $\mathcal{N}(0, 1)$ and $500$ games, estimate the strengths with `glm(..., family = binomial)` (one player fixed at $0$), and compare the estimated ranking with the true one and with the ranking by the proportion of wins: first with random opponents, then when each player mostly meets opponents of similar strength (as in sports leagues: the $1$ or $2$ players just above or below in the true ranking).
+
+**Answer**
+
+```{r}
+#| label: bradley-terry
+#| tags: [going-further]
+set.seed(9)
+theta <- rnorm(10)
+bradley_terry <- function(games) {
+  design <- matrix(0, nrow(games), 10)
+  design[cbind(seq_len(nrow(games)), games$i)] <- 1
+  design[cbind(seq_len(nrow(games)), games$j)] <- -1
+  estimated <- c(0, coef(glm(games$win ~ design[, -1] - 1, family = binomial)))
+  wins <- map_dbl(1:10, \(p) mean(c(games$win[games$i == p], 1 - games$win[games$j == p])))
+  c(`Bradley-Terry` = cor(estimated, theta, method = "spearman"), `proportion of wins` = cor(wins, theta, method = "spearman"))
+}
+random_games <- tibble(i = sample(10, 500, replace = TRUE), j = sample(10, 500, replace = TRUE)) |> filter(i != j)
+by_rank <- order(theta)                                    # by_rank[k] = player of rank k
+league_games <- tibble(k = sample(10, 500, replace = TRUE), shift = sample(c(-2, -1, 1, 2), 500, replace = TRUE)) |>
+  mutate(k2 = k + shift) |> filter(k2 >= 1, k2 <= 10) |> transmute(i = by_rank[k], j = by_rank[k2])
+rbind(`random opponents` = bradley_terry(random_games |> mutate(win = rbinom(n(), 1, plogis(theta[i] - theta[j])))),
+      `opponents of similar strength` = bradley_terry(league_games |> mutate(win = rbinom(n(), 1, plogis(theta[i] - theta[j])))))
+```
+
+**Conclusion** With random opponents, the Bradley–Terry estimates and the proportions of wins give the same ranking (Spearman correlation $0.88$ with the true strengths): each player meets a representative set of opponents. When players mostly meet opponents of similar strength, as in leagues, the proportion of wins is close to $1/2$ for everybody and says almost nothing ($0.53$), while the Bradley–Terry model, which accounts for the strength of the opponents, recovers the ranking almost perfectly ($0.99$). It is the model behind Elo ratings, and behind the reward models of RLHF (Lecture 6).
+
+---
+
+### Structured data: blocked cross validation (★)
+
+When the observations are not independent (time series, spatial data, repeated measures of the same individuals), a random cross validation puts dependent observations in the training and the validation parts and is optimistic. *Blocked* cross validation keeps the dependent observations together (Lab 1 did it for time series).
+
+**Question** Simulate $50$ patients with $20$ measures each, $y = $ patient effect $+ \varepsilon$, and $x$ = noisy copy of the patient identifier effect (a feature which identifies the patient but does not generalize to new patients). Compare the RMSE of a random forest (`ranger`) estimated by a random $5$-fold cross validation and by a $5$-fold cross validation grouped by patient, with its RMSE on new patients.
+
+**Answer**
+
+```{r}
+#| label: blocked-cv
+#| tags: [going-further]
+library(ranger)
+set.seed(10)
+simulate_patients <- function(n_patients) {
+  effect <- rnorm(n_patients, 0, 2)
+  tibble(patient = rep(seq_len(n_patients), each = 20), signature = rep(runif(n_patients), each = 20) + rnorm(20 * n_patients, 0, 0.001),
+         x = rnorm(20 * n_patients), y = rep(effect, each = 20) + 0.5 * x + rnorm(20 * n_patients))
+}
+patients <- simulate_patients(50)
+new_patients <- simulate_patients(50)
+cv_rmse <- function(folds) mean(map_dbl(1:5, function(v) {
+  fit <- ranger(y ~ signature + x, data = patients[folds != v, ])
+  sqrt(mean((predict(fit, patients[folds == v, ])$predictions - patients$y[folds == v])^2))
+}))
+c(`random 5-fold CV` = cv_rmse(sample(rep(1:5, length.out = nrow(patients)))),
+  `5-fold CV grouped by patient` = cv_rmse(rep(sample(rep(1:5, 10)), each = 20)),
+  `new patients` = sqrt(mean((predict(ranger(y ~ signature + x, data = patients), new_patients)$predictions - new_patients$y)^2)))
+```
+
+**Conclusion** The random $5$-fold cross validation estimates an RMSE of $1.41$, the cross validation grouped by patient $2.31$, and the RMSE on new patients is $2.90$. With random folds, the measures of a patient are in both the training and the validation parts, and the random forest recognizes the patient through the `signature` feature: it predicts the patient effect, which is impossible for a new patient. Grouping the folds by patient gives a much more honest estimate. The validation must reproduce the way the model will be used.
+
+---
+
+### Classification metrics: ROC and precision-recall (★)
+
+The *Metrics* section of the lecture: a classifier with scores can be evaluated by its ROC curve (true positive rate against false positive rate, for all the thresholds) and its precision-recall curve. The area under the ROC curve (AUC) is the probability that a random positive gets a higher score than a random negative.
+
+**Question** Train a logistic regression (`glm`) to recognize the digit `8` against the others on half of the digits, plot its ROC and precision-recall curves on the other half (`yardstick`), and check that its AUC is the proportion of (positive, negative) pairs correctly ordered.
+
+**Answer**
+
+```{r}
+#| label: roc-pr
+#| tags: [going-further]
+library(yardstick)
+set.seed(11)
+half <- sample(nrow(pixels), nrow(pixels) / 2)
+binary <- tibble(as_tibble(pca$x[, 1:20]), eight = factor(labels == "8", levels = c(TRUE, FALSE)))
+fit_eight <- glm(eight == "TRUE" ~ ., data = binary[half, ], family = binomial)
+scores <- binary[-half, ] |> mutate(score = predict(fit_eight, binary[-half, ], type = "response"))
+(autoplot(roc_curve(scores, eight, score)) + autoplot(pr_curve(scores, eight, score)))
+positives <- scores$score[scores$eight == "TRUE"]; negatives <- scores$score[scores$eight == "FALSE"]
+c(`yardstick AUC` = roc_auc(scores, eight, score)$.estimate, `ordered pairs` = mean(outer(positives, negatives, ">")))
+```
+
+**Conclusion** The ROC curve of the logistic regression is close to the upper left corner (AUC $0.96$): most `8` get a higher score than most other digits. The precision-recall curve is more severe, as the `8` are only $10\%$ of the digits: a small false positive rate still produces many false positives compared with the true ones. The AUC computed by `yardstick` is exactly the proportion of (positive, negative) pairs ranked in the right order ($0.962$): it is the probability that a random positive gets a higher score than a random negative.
+
+---
+
+### Multiple correspondence analysis (★★)
+
+For categorical data, the analogue of the PCA is the *multiple correspondence analysis* (MCA, `FactoMineR`): it decomposes the table of indicators of the categories, with weights that make it a $\chi^2$ analysis. The lecture uses the `poison` data: $55$ children, their symptoms and what they ate.
+
+**Question** Run an MCA on the symptoms and food variables of `poison` (`MCA(poison[, 5:15])`), plot the categories on the first plane, and interpret the first axis.
+
+**Answer**
+
+```{r}
+#| label: mca
+#| tags: [going-further]
+library(FactoMineR)
+data(poison)
+mca <- MCA(poison[, 5:15], graph = FALSE)
+head(mca$eig, 4)
+categories <- as_tibble(mca$var$coord[, 1:2], rownames = "category") |> rename(dim1 = `Dim 1`, dim2 = `Dim 2`)
+ggplot(categories, aes(dim1, dim2, label = category)) + geom_point() + geom_text(size = 3, vjust = -0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed") + geom_vline(xintercept = 0, linetype = "dashed")
+```
+
+**Conclusion** The first axis of the MCA explains $34\%$ of the inertia and opposes the sick children (symptoms present: nausea, vomiting, diarrhea, fever, abdominal pain on the left) to the healthy ones (symptoms absent on the right), together with what they ate: not eating mayonnaise or cheese is on the healthy side. The second axis is driven by rare categories (children who did not eat potatoes, fish or courgettes), a typical effect of rare modalities in MCA. As the PCA for numerical data, the MCA summarizes the associations between categorical variables on a few axes.
+
+---
+
+### ICA and NMF (★★)
+
+Other linear decompositions impose other constraints than orthogonality: *independent component analysis* (ICA) looks for statistically independent (non-Gaussian) components, and *non-negative matrix factorization* (NMF) for a decomposition $X \approx WH$ with $W, H \geq 0$, whose components are *parts* of the images.
+
+**Question** Compute $10$ components of the digits with `fastICA` and with an NMF implemented with the multiplicative updates of Lee and Seung ($H \leftarrow H \odot \frac{W^\top X}{W^\top W H}$, $W \leftarrow W \odot \frac{X H^\top}{W H H^\top}$, $200$ iterations), and plot them as images. Compare with the principal directions.
+
+**Answer**
+
+```{r}
+#| label: ica-nmf
+#| tags: [going-further]
+library(fastICA)
+set.seed(12)
+ica <- fastICA(pixels, n.comp = 10)
+nmf <- function(X, rank, iterations = 200) {
+  W <- matrix(runif(nrow(X) * rank), nrow(X), rank); H <- matrix(runif(rank * ncol(X)), rank, ncol(X))
+  for (it in seq_len(iterations)) {
+    H <- H * (t(W) %*% X) / (t(W) %*% W %*% H + 1e-9)
+    W <- W * (X %*% t(H)) / (W %*% H %*% t(H) + 1e-9)
+  }
+  list(W = W, H = H, error = mean((X - W %*% H)^2))
+}
+nmf_fit <- nmf(pixels, 10)
+rescale_rows <- function(m) m / apply(abs(m), 1, max)               # each image on its own scale
+image_tiles(rescale_rows(ica$A), paste("ICA", 1:10)) / image_tiles(rescale_rows(nmf_fit$H), paste("NMF", 1:10)) /
+  image_tiles(rescale_rows(t(pca$rotation[, 1:10])), paste("PCA", 1:10))
+```
+
+**Conclusion** The NMF components are non-negative and sparse: each one is a *part* of a digit (a stroke, a loop, a vertical bar), and a digit is reconstructed as an additive combination of parts. The principal directions are global contrasts with positive and negative regions, as are the ICA components (which look for statistically independent, non-Gaussian sources; some are localized, others noisy). The constraints of the decomposition (orthogonality, independence, positivity) determine the components, and their interpretability.
+
+---
+
+### Kernel PCA and Laplacian eigenmaps (★★)
+
+Kernel PCA (PC4) performs a PCA in the feature space of a kernel: it only needs the centered kernel matrix $HKH$ and its eigenvectors. *Laplacian eigenmaps* embed the points with the eigenvectors of the smallest nonzero eigenvalues of the Laplacian $L = D - W$ of a neighborhood graph (the same graph as Isomap), which keep the neighbors close.
+
+**Question** Compute a Gaussian kernel PCA of the Swiss roll (by hand: kernel matrix, double centering, eigenvectors scaled by $\sqrt{\lambda}$) and its Laplacian eigenmap (graph of the $10$ nearest neighbors, normalized Laplacian). Compare with the PCA and Isomap embeddings of the core part.
+
+**Answer**
+
+```{r}
+#| label: kernel-pca-laplacian
+#| tags: [going-further]
+n_roll <- nrow(swiss)
+K <- exp(-as.matrix(dist(swiss))^2 / (2 * 5^2))
+H <- diag(n_roll) - 1 / n_roll
+eig <- eigen(H %*% K %*% H, symmetric = TRUE)
+kpca <- eig$vectors[, 1:2] %*% diag(sqrt(eig$values[1:2]))
+nn <- kNN(swiss, k = 10)
+Wg <- matrix(0, n_roll, n_roll); Wg[cbind(rep(seq_len(n_roll), 10), as.vector(nn$id))] <- 1; Wg <- pmax(Wg, t(Wg))
+Dm <- diag(1 / sqrt(rowSums(Wg)))
+eig_l <- eigen(diag(n_roll) - Dm %*% Wg %*% Dm, symmetric = TRUE)
+laplacian <- eig_l$vectors[, (n_roll - 2):(n_roll - 1)]
+bind_rows(tibble(method = "kernel PCA", x = kpca[, 1], y = kpca[, 2], t = t_roll),
+          tibble(method = "Laplacian eigenmap", x = laplacian[, 2], y = laplacian[, 1], t = t_roll)) |>
+  ggplot(aes(x, y, color = t)) + geom_point(size = 0.5) + facet_wrap(~ method, scales = "free") + scale_color_viridis_c()
+```
+
+**Conclusion** With a Gaussian kernel of width $5$, the kernel PCA does not unroll the Swiss roll: its first two components still show a folded structure in which distant positions along the roll overlap. The kernel width would have to be tuned, and a global method has difficulties with this geometry. The Laplacian eigenmap, built on the same neighborhood graph as Isomap, orders the points along the roll: its coordinates are smooth functions of $t$, the whole roll being mapped onto a curve. Local methods (Isomap, Laplacian eigenmaps) exploit the neighborhood graph and recover the intrinsic coordinate.
+
+---
+
+### Stability and parameters of t-SNE and UMAP (★★)
+
+t-SNE and UMAP depend on random initializations and on parameters that change the maps a lot. We measure each map with two scores: the *local* score is the neighbor preservation of the core part; the *global* score is the Spearman correlation between the distances of the $10$ digit centroids in the original space and in the map (does the map keep which digits are far apart?).
+
+```{r}
+#| label: map-scores
+#| tags: [going-further]
+global_score <- function(X, embedding, groups = labels) {
+  centroids <- function(Z) rowsum(Z, groups) / as.vector(table(groups))
+  cor(as.vector(dist(centroids(X))), as.vector(dist(centroids(embedding))), method = "spearman")
+}
+scores <- function(embedding) c(local = knn_preservation(pixels, embedding), global = global_score(pixels, embedding))
+maps_points <- function(maps) maps |> mutate(points = map(embedding, \(e) tibble(x = e[, 1], y = e[, 2], digit = labels))) |>
+  select(-embedding) |> unnest(points)
+map_theme <- list(geom_point(size = 0.1), guides(color = guide_legend(override.aes = list(size = 3))),
+                  theme(axis.text = element_blank(), axis.ticks = element_blank()), labs(x = NULL, y = NULL))
+```
+
+**Question** Run t-SNE (perplexity $30$) with $3$ seeds, first with its default random initialization, then initialized with the first two principal components (scaled to a small standard deviation, argument `Y_init`), and UMAP with $3$ seeds. Plot the maps and compute their two scores. What is stable?
+
+**Answer**
+
+```{r}
+#| label: stability-seeds
+#| tags: [going-further]
+pca_init <- scale(pca$x[, 1:2]) * 1e-4
+runs <- expand_grid(method = c("t-SNE, random init", "t-SNE, PCA init", "UMAP"), seed = 1:3) |>
+  mutate(embedding = map2(method, seed, function(method, seed) {
+    set.seed(seed)
+    switch(method,
+           `t-SNE, random init` = Rtsne(pcs50, perplexity = 30, pca = FALSE)$Y,
+           `t-SNE, PCA init` = Rtsne(pcs50, perplexity = 30, pca = FALSE, Y_init = pca_init,
+                                     stop_lying_iter = 250, mom_switch_iter = 250)$Y,  # the defaults without Y_init
+           UMAP = umap(pixels, seed = seed))
+  }))
+ggplot(maps_points(runs), aes(x, y, color = digit)) + map_theme + facet_grid(method ~ seed, scales = "free")
+runs |> mutate(score = map(embedding, scores)) |> unnest_wider(score) |> select(-embedding)
+```
+
+**Conclusion** With a random initialization, t-SNE gives different maps for different seeds: the clusters are the same (the local score is $0.587$ for the three seeds), but their positions change, and so does the global score ($0.58$ to $0.68$). Initialized with the PCA, t-SNE gives the same map for every seed (its optimization is deterministic once the initial positions are fixed) and a better global score ($0.78$): the PCA, which preserves the large distances, gives the layout, and t-SNE refines the neighborhoods. UMAP (initialized with a spectral embedding, but optimized by a stochastic gradient) keeps its local score ($0.48$ to $0.49$), but its global score also varies ($0.51$ to $0.69$). Only the neighborhoods are reliable: the relative positions of the clusters should be checked on several runs, or anchored by a PCA initialization.
+
+---
+
+**Question** Run UMAP (seed $1$) with `n_neighbors` in $\{5, 15, 50, 200\}$ and `min_dist` in $\{0, 0.1, 0.5, 0.99\}$. Plot the $16$ maps, and the two scores as functions of the parameters.
+
+**Answer**
+
+```{r}
+#| label: umap-parameters
+#| tags: [going-further]
+umap_grid <- expand_grid(n_neighbors = c(5, 15, 50, 200), min_dist = c(0, 0.1, 0.5, 0.99)) |>
+  mutate(embedding = map2(n_neighbors, min_dist, \(k, d) umap(pixels, n_neighbors = k, min_dist = d, seed = 1)))
+ggplot(maps_points(umap_grid), aes(x, y, color = digit)) + map_theme +
+  facet_grid(min_dist ~ n_neighbors, scales = "free", labeller = label_both)
+umap_grid |> mutate(score = map(embedding, scores)) |> unnest_wider(score) |> select(-embedding) |>
+  pivot_longer(c(local, global), names_to = "score") |>
+  ggplot(aes(factor(n_neighbors), factor(min_dist), fill = value)) + geom_tile() +
+  geom_text(aes(label = round(value, 2)), size = 3) + facet_wrap(~ score) + scale_fill_viridis_c() +
+  labs(x = "n_neighbors", y = "min_dist")
+```
+
+**Conclusion** `n_neighbors` sets the scale of the neighborhoods that UMAP preserves. With $5$ neighbors, the local score is the best ($0.46$ to $0.51$) and the clusters are well separated; with $200$ neighbors, the local score drops ($0.31$ to $0.42$) and some clusters merge, but the global score is the best ($0.69$ to $0.81$, against $0.53$ to $0.60$ with $15$ neighbors): the $0$ stays alone, far from the other digits. `min_dist` controls how tightly the points of a cluster are packed: with $0.99$, the clusters fill the map and touch each other, and the local score is lower ($0.31$ to $0.46$); it changes the global score much less than `n_neighbors`. There is no best map: the parameters choose the scale of the structure that is shown.
+
+---
+
+**Question** Run t-SNE (seed $1$) with the perplexities $2$, $5$, $30$ and $100$ and, for the perplexity $30$, with the early exaggeration factors $4$, $12$ (the default) and $30$ (`exaggeration_factor`). Plot the maps and compute their scores.
+
+**Answer**
+
+```{r}
+#| label: tsne-parameters
+#| tags: [going-further]
+tsne_runs <- bind_rows(
+  tibble(parameter = "perplexity", value = c(2, 5, 30, 100)) |>
+    mutate(embedding = map(value, \(p) { set.seed(1); Rtsne(pcs50, perplexity = p, pca = FALSE)$Y })),
+  tibble(parameter = "exaggeration", value = c(4, 12, 30)) |>
+    mutate(embedding = map(value, \(a) { set.seed(1); Rtsne(pcs50, perplexity = 30, pca = FALSE, exaggeration_factor = a)$Y }))) |>
+  mutate(run = fct_inorder(paste(parameter, value)))
+ggplot(maps_points(tsne_runs), aes(x, y, color = digit)) + map_theme + facet_wrap(~ run, nrow = 2, scales = "free")
+tsne_runs |> mutate(score = map(embedding, scores)) |> unnest_wider(score) |> select(parameter, value, local, global)
+```
+
+**Conclusion** The perplexity is the effective number of neighbors of t-SNE. With $2$, the map is a single cloud of small groups (local score $0.48$) and the global structure is lost (global score $0.04$); with $5$, the digits are separated but fragmented. The perplexity $30$ gives the best local score ($0.587$), and $100$ the best global score ($0.80$, against $0.58$ for $30$) at the price of a lower local score ($0.53$): as for UMAP's `n_neighbors`, larger neighborhoods keep more of the global structure. The early exaggeration, which multiplies the attractions during the first $250$ iterations so that the clusters form before they spread, hardly changes the local score ($0.58$ to $0.59$); a larger factor slightly improves the global layout here ($0.52$, $0.58$ and $0.65$ for $4$, $12$ and $30$).
+
+---
+
+### k-medoids and HDBSCAN (★)
+
+$k$-medoids (PAM) uses actual observations as centers and any dissimilarity, which makes it more robust than $k$-means. HDBSCAN builds the hierarchy of the DBSCAN clusterings for all the values of $\varepsilon$ and keeps the most stable clusters: it needs only a minimal cluster size.
+
+**Question** Compare on the toy datasets the ARI of PAM (`cluster::pam`) and HDBSCAN (`dbscan::hdbscan`, `minPts = 10`) with the methods of the core part.
+
+**Answer**
+
+```{r}
+#| label: pam-hdbscan
+#| tags: [going-further]
+imap_dfr(toy, function(data, name) {
+  X <- as.matrix(select(data, x, y)); K <- n_distinct(data$group)
+  tibble(dataset = name, `k-medoids (PAM)` = adjustedRandIndex(pam(X, K)$clustering, data$group),
+         HDBSCAN = adjustedRandIndex(hdbscan(X, minPts = 10)$cluster, data$group))
+})
+```
+
+**Conclusion** PAM behaves like $k$-means: very good on the blobs ($0.90$) and useless on the elongated groups and on the rings, as it also looks for compact groups around centers. HDBSCAN finds the rings perfectly, as DBSCAN, without choosing $\varepsilon$, but it labels many points of the blobs and of the elongated groups as noise or splits them (ARI about $0.5$): a density-based method needs groups separated by low-density regions.
+
+---
+
+### Spectral clustering (★★)
+
+Spectral clustering embeds the points with the first eigenvectors of the normalized Laplacian of a neighborhood graph (as the Laplacian eigenmaps), then runs $k$-means in this embedding: it finds groups that are *connected*, not necessarily compact.
+
+**Question** Implement spectral clustering (graph of the $10$ nearest neighbors, normalized Laplacian, $K$ eigenvectors of the smallest eigenvalues, rows normalized, $k$-means) and compare its ARI on the rings with $k$-means.
+
+**Answer**
+
+```{r}
+#| label: spectral
+#| tags: [going-further]
+spectral_clustering <- function(X, K, k = 10) {
+  n <- nrow(X); nn <- kNN(X, k = k)
+  W <- matrix(0, n, n); W[cbind(rep(seq_len(n), k), as.vector(nn$id))] <- 1; W <- pmax(W, t(W))
+  Dm <- diag(1 / sqrt(rowSums(W)))
+  eig <- eigen(diag(n) - Dm %*% W %*% Dm, symmetric = TRUE)
+  U <- eig$vectors[, (n - K + 1):n]
+  U <- U / sqrt(rowSums(U^2))
+  kmeans(U, K, nstart = 20)$cluster
+}
+rings <- toy$rings
+c(`spectral clustering` = adjustedRandIndex(spectral_clustering(as.matrix(select(rings, x, y)), 2), rings$group),
+  `k-means` = adjustedRandIndex(kmeans(as.matrix(select(rings, x, y)), 2, nstart = 20)$cluster, rings$group))
+```
+
+**Conclusion** Spectral clustering separates the two rings perfectly (ARI $1$), where $k$-means fails completely ($0$): in the space of the first eigenvectors of the Laplacian of the neighborhood graph, the two connected components of the graph become two compact groups that $k$-means separates easily. It is the clustering counterpart of the Laplacian eigenmaps.
+
+---
+
+### EM for Gaussian mixtures (★★)
+
+PC4 shows that the EM algorithm is a coordinate ascent of the ELBO: the E step computes the *responsibilities* $r_{ik} = \pi_k\varphi_k(x_i)/\sum_l\pi_l\varphi_l(x_i)$, the M step updates the proportions, means and covariances with these weights.
+
+**Question** Implement EM for a mixture of $3$ Gaussians with full covariances, run it on the blobs, plot the log-likelihood along the iterations (it must never decrease), and compare the result with `Mclust`.
+
+**Answer**
+
+```{r}
+#| label: em
+#| tags: [going-further]
+library(mvtnorm)
+em_gmm <- function(X, K, iterations = 50, seed = 1) {
+  set.seed(seed)
+  n <- nrow(X); mu <- X[sample(n, K), , drop = FALSE]; Sigma <- replicate(K, cov(X), simplify = FALSE); pi_k <- rep(1 / K, K)
+  loglik <- numeric(iterations)
+  for (it in seq_len(iterations)) {
+    dens <- sapply(1:K, \(k) pi_k[k] * dmvnorm(X, mu[k, ], Sigma[[k]]))
+    loglik[it] <- sum(log(rowSums(dens)))
+    r <- dens / rowSums(dens)                                    # E step
+    nk <- colSums(r); pi_k <- nk / n                             # M step
+    mu <- t(r) %*% X / nk
+    Sigma <- lapply(1:K, \(k) { Xc <- sweep(X, 2, mu[k, ]); t(Xc * r[, k]) %*% Xc / nk[k] })
+  }
+  dens <- sapply(seq_len(K), \(k) pi_k[k] * dmvnorm(X, mu[k, ], Sigma[[k]]))
+  list(cluster = max.col(dens), loglik = c(loglik, sum(log(rowSums(dens)))), mu = mu)
+}
+X_blobs <- as.matrix(select(toy$blobs, x, y))
+em <- em_gmm(X_blobs, 3)
+ggplot(tibble(iteration = seq_along(em$loglik) - 1, `log-likelihood` = em$loglik), aes(iteration, `log-likelihood`)) + geom_line() + geom_point()
+c(`never decreases` = all(diff(em$loglik) >= -1e-8), `ARI (our EM)` = adjustedRandIndex(em$cluster, toy$blobs$group),
+  `ARI (Mclust)` = adjustedRandIndex(Mclust(X_blobs, G = 3, modelNames = "VVV", verbose = FALSE)$classification, toy$blobs$group))
+```
+
+**Conclusion** The log-likelihood increases at each iteration of our EM (it never decreases: EM is a coordinate ascent of the ELBO, PC4), and converges in a few iterations. Our mixture reaches the same ARI as `Mclust` ($0.884$): the E step (responsibilities) and the M step (weighted proportions, means and covariances) are all there is to it. In practice, the initialization matters (several starts, or a hierarchical initialization as in `mclust`).
+
+---
+
+### Two moons, a toy generative problem (★)
+
+The generative blocks below use the *two moons* of the lecture, a 2D distribution which is easy to plot but not Gaussian. A generator is good if its samples look like the data, cover both moons, and do not simply copy the training points.
+
+```{r}
+#| label: two-moons
+#| tags: [going-further]
+two_moons <- function(n, noise = 0.06) {
+  moon <- rbinom(n, 1, 0.5); t <- runif(n, 0, pi)
+  x <- cbind(ifelse(moon == 0, cos(t), 1 - cos(t)), ifelse(moon == 0, sin(t), 0.5 - sin(t))) + matrix(rnorm(2 * n, 0, noise), n, 2)
+  scale(x, center = c(0.5, 0.25), scale = c(0.9, 0.5))
+}
+set.seed(13)
+moons <- two_moons(2000)
+moons_tensor <- torch_tensor(moons, dtype = torch_float())
+plot_samples <- function(samples_list) {
+  imap_dfr(samples_list, \(s, name) tibble(method = name, x = s[, 1], y = s[, 2])) |>
+    mutate(method = factor(method, levels = names(samples_list))) |>
+    ggplot(aes(x, y)) + geom_point(size = 0.3, alpha = 0.5) + facet_wrap(~ method, nrow = 1) + coord_equal(xlim = c(-2.5, 2.5), ylim = c(-2.5, 2.5))
+}
+mlp <- function(input, output, hidden = 64) nn_sequential(nn_linear(input, hidden), nn_silu(), nn_linear(hidden, hidden), nn_silu(), nn_linear(hidden, output))
+plot_samples(list(data = moons))
+```
+
+**Question** *Predict before you run:* what do the samples of a single Gaussian fitted to the two moons look like? And of a mixture of $10$ Gaussians? Check it.
+
+**Answer**
+
+```{r}
+#| label: gaussian-baselines
+#| tags: [going-further]
+gaussian <- MASS::mvrnorm(2000, colMeans(moons), cov(moons))
+gmm10 <- Mclust(moons, G = 10, modelNames = "VVV", verbose = FALSE)
+plot_samples(list(data = moons, Gaussian = gaussian, `mixture of 10 Gaussians` = sim(gmm10$modelName, gmm10$parameters, 2000)[, -1]))
+```
+
+**Conclusion** A single Gaussian only captures the mean and the covariance of the two moons: its samples form an elliptical cloud covering the empty regions between the moons. A mixture of $10$ Gaussians follows the moons with a chain of small ellipses, and its samples are already very close to the data: in dimension $2$, a mixture is a strong generative model. The difficulty of generative modeling comes with the dimension.
+
+---
+
+### A variational autoencoder (★★)
+
+A VAE (PC4, *EM and the ELBO*) has a latent variable $z \sim \mathcal{N}(0, I)$ and a decoder $x | z \sim \mathcal{N}(g_\theta(z), \sigma^2 I)$. As the posterior of $z$ is intractable, an *encoder* $q_\phi(z|x) = \mathcal{N}(\mu_\phi(x), \text{diag}(s^2_\phi(x)))$ is trained jointly to maximize the ELBO $\mathbb{E}_{q_\phi}[\log p_\theta(x|z)] - \text{KL}(q_\phi(\cdot|x), \mathcal{N}(0, I))$, with the *reparametrization* $z = \mu_\phi(x) + s_\phi(x)\epsilon$, $\epsilon \sim \mathcal{N}(0, I)$, so that the gradient goes through the sampling.
+
+**Question** Train a VAE with a 2D latent space on the two moons ($\sigma = 0.1$, $3000$ steps of Adam on mini-batches of $256$), and sample new points by adding independent decoder noise to the means obtained by decoding $z \sim \mathcal{N}(0, I)$. Then train one on the digits (latent dimension $2$, pixels scaled to $[0, 1]$) and decode a grid of codes.
+
+**Answer**
+
+```{r}
+#| label: vae
+#| tags: [going-further]
+train_vae <- function(x, latent = 2, sigma = 0.1, steps = 3000, hidden = 64, lr = 2e-3) {
+  torch_manual_seed(14); set.seed(14)   # torch and R (mini-batches) random generators
+  d <- x$size(2)
+  encoder <- mlp(d, 2 * latent, hidden); decoder <- mlp(latent, d, hidden)
+  optimizer <- optim_adam(c(encoder$parameters, decoder$parameters), lr = lr)
+  for (step in seq_len(steps)) {
+    batch <- x[sample(x$size(1), 256), ]
+    stats <- encoder(batch); mu <- stats[, 1:latent]; log_var <- stats[, (latent + 1):(2 * latent)]
+    z <- mu + torch_exp(0.5 * log_var) * torch_randn_like(mu)                       # reparametrization
+    reconstruction <- torch_sum((decoder(z) - batch)^2, dim = 2) / (2 * sigma^2)
+    kl <- 0.5 * torch_sum(torch_exp(log_var) + mu^2 - 1 - log_var, dim = 2)
+    loss <- torch_mean(reconstruction + kl)                                          # minus the ELBO (up to a constant)
+    optimizer$zero_grad(); loss$backward(); optimizer$step()
+  }
+  list(encoder = encoder, decoder = decoder, loss = loss$item())
+}
+vae_moons <- train_vae(moons_tensor)
+vae_samples <- as.matrix(with_no_grad(vae_moons$decoder(torch_randn(2000, 2)) + 0.1 * torch_randn(2000, 2)))
+plot_samples(list(data = moons, VAE = vae_samples))
+```
+
+```{r}
+#| label: vae-digits
+#| tags: [going-further]
+vae_digits <- train_vae(torch_tensor(pixels / 16, dtype = torch_float()), latent = 2, sigma = 0.3, steps = 4000, hidden = 256)
+grid_codes <- as.matrix(expand_grid(z1 = qnorm(seq(0.05, 0.95, length.out = 8)), z2 = qnorm(seq(0.05, 0.95, length.out = 8))))
+decoded <- 16 * as.matrix(with_no_grad(vae_digits$decoder(torch_tensor(grid_codes, dtype = torch_float()))))
+image_tiles(decoded, as.character(1:64), nrow = 8) + theme(strip.text = element_blank()) + ggtitle("decoded 8 x 8 grid of codes")
+```
+
+**Conclusion** The VAE on the two moons generates points that roughly follow the moons but also fill the region between them: with a Gaussian decoder of fixed variance, the decoded points are blurred, and the prior $\mathcal{N}(0, I)$ also covers codes that the encoder does not use. On the digits, decoding a regular $8 \times 8$ grid of codes shows a continuous latent space: neighboring codes give similar images, and the digit changes progressively from one region to another ($6$ to $4$ along the top, $1$, $7$ and $9$ in the middle, $2$, $3$ and $0$ along the bottom), almost all the classes being represented. The latent space is organized, which is what the KL term of the ELBO enforces.
+
+---
+
+### Langevin sampling (★★)
+
+If the *score* $\nabla_x \log p(x)$ of a density is known, the Langevin dynamics $x_{t+1} = x_t + \frac{\eta}{2}\nabla\log p(x_t) + \sqrt{\eta}\,\xi_t$ ($\xi_t \sim \mathcal{N}(0, I)$) approximates $p$ for small steps and sufficiently long runs. For a standard normal target the stationary variance is $1/(1-\eta/4)$ when $0<\eta<4$, so a longer run still has fixed-step bias. Score-based models learn the score; here we use the exact score of the mixture of $10$ Gaussians fitted above. With isolated modes, the dynamics hardly jumps between them: *annealing* (starting with a smoothed density) helps.
+
+**Question** Implement the Langevin dynamics with the score of the Gaussian mixture `gmm10`, starting from $2000$ points uniform in $[-2.5, 2.5]^2$, with $\eta = 0.01$ and $500$ steps. Then start all the points from the same point $(-1.2, 0.5)$ (on the left moon): do the samples reach the right moon?
+
+**Answer**
+
+```{r}
+#| label: langevin
+#| tags: [going-further]
+gmm_score <- function(x, fit = gmm10) {
+  params <- fit$parameters; K <- length(params$pro)
+  dens <- sapply(1:K, \(k) params$pro[k] * mvtnorm::dmvnorm(x, params$mean[, k], params$variance$sigma[, , k]))
+  r <- dens / rowSums(dens)
+  Reduce(`+`, lapply(1:K, \(k) r[, k] * t(solve(params$variance$sigma[, , k], params$mean[, k] - t(x)))))
+}
+langevin <- function(x, eta = 0.01, steps = 500) {
+  for (step in seq_len(steps)) x <- x + eta / 2 * gmm_score(x) + sqrt(eta) * matrix(rnorm(length(x)), ncol = 2)
+  x
+}
+set.seed(15)
+from_uniform <- langevin(matrix(runif(4000, -2.5, 2.5), ncol = 2))
+from_one_point <- langevin(matrix(rep(c(-1.2, 0.5), each = 2000), ncol = 2))
+plot_samples(list(data = moons, `Langevin from uniform` = from_uniform, `Langevin from one point` = from_one_point))
+```
+
+**Conclusion** Starting from uniform points, the Langevin dynamics driven by the score of the mixture converges to samples that look like the two moons. Started from a single point on the left moon, almost all the samples stay on this moon after $500$ steps, and very few reach the right one: the dynamics is local, and crossing the low-density region between the modes takes a very long time. This is why score-based models add noise at several scales (annealing): the smoothed densities connect the modes.
+
+---
+
+### A normalizing flow: Real NVP (★★)
+
+A normalizing flow is an invertible map $x = G(\omega)$ from a Gaussian $\omega$; its density is given by the change of variables formula, so that it can be trained by maximum likelihood. Real NVP composes *affine coupling layers*: half of the coordinates are kept, the other half is transformed by $x_2 = \omega_2 \odot e^{s(\omega_1)} + t(\omega_1)$, whose Jacobian is triangular with log-determinant $\sum s(\omega_1)$.
+
+**Question** Train a Real NVP with $4$ coupling layers (alternating the coordinate that is transformed) on the two moons by maximum likelihood ($2000$ steps of Adam, mini-batches of $512$ points), and sample from it.
+
+**Answer**
+
+```{r}
+#| label: real-nvp
+#| tags: [going-further]
+coupling <- nn_module(
+  initialize = function(flip) { self$flip <- flip; self$net <- mlp(1, 2, 64) },
+  forward = function(x) {   # data -> latent, with the log-determinant
+    keep <- if (self$flip) x[, 2, drop = FALSE] else x[, 1, drop = FALSE]
+    change <- if (self$flip) x[, 1, drop = FALSE] else x[, 2, drop = FALSE]
+    st <- self$net(keep); s <- torch_tanh(st[, 1, drop = FALSE]); t <- st[, 2, drop = FALSE]
+    z <- (change - t) * torch_exp(-s)
+    list(x = if (self$flip) torch_cat(list(z, keep), 2) else torch_cat(list(keep, z), 2), log_det = -s$squeeze(2))
+  },
+  inverse = function(z) {   # latent -> data
+    keep <- if (self$flip) z[, 2, drop = FALSE] else z[, 1, drop = FALSE]
+    change <- if (self$flip) z[, 1, drop = FALSE] else z[, 2, drop = FALSE]
+    st <- self$net(keep); s <- torch_tanh(st[, 1, drop = FALSE]); t <- st[, 2, drop = FALSE]
+    x <- change * torch_exp(s) + t
+    if (self$flip) torch_cat(list(x, keep), 2) else torch_cat(list(keep, x), 2)
+  })
+torch_manual_seed(16); set.seed(16)
+layers <- lapply(1:4, \(l) coupling(flip = l %% 2 == 0))
+optimizer <- optim_adam(unlist(lapply(layers, \(l) l$parameters)), lr = 2e-3)
+for (step in 1:2000) {
+  x <- moons_tensor[sample(2000, 512), ]; log_det <- torch_zeros(512)
+  for (layer in layers) { out <- layer(x); x <- out$x; log_det <- log_det + out$log_det }
+  loss <- -torch_mean(-0.5 * torch_sum(x^2, dim = 2) + log_det)   # minus the log-likelihood (up to a constant)
+  optimizer$zero_grad(); loss$backward(); optimizer$step()
+}
+nvp_samples <- with_no_grad({ z <- torch_randn(2000, 2); for (layer in rev(layers)) z <- layer$inverse(z); as.matrix(z) })
+plot_samples(list(data = moons, `Real NVP` = nvp_samples))
+```
+
+**Conclusion** The Real NVP transforms the Gaussian into a distribution that follows the two moons, with a few points in the gap between them and at the ends: an invertible map has to "tear" the Gaussian to create two separate components, which is difficult with a few coupling layers and limited training. Its strength is the exact likelihood, which allows training it by maximum likelihood and evaluating it.
+
+---
+
+### Flow matching (★★)
+
+Diffusion models and flow matching transport a Gaussian to the data distribution along a path of distributions. In (rectified) *flow matching*, $x_t = (1-t)\omega + t x$ interpolates between a Gaussian sample $\omega$ and a data point $x$, and a network $v_\theta(x_t, t)$ is trained to predict the velocity $x - \omega$ by least squares. New samples are then obtained by solving the ODE $\dot x_t = v_\theta(x_t, t)$ from $t = 0$ to $1$.
+
+**Question** Train a flow matching velocity field on the two moons ($6000$ steps of Adam with mini-batches of $1024$ points; the time $t$ is given to the network with a few Fourier features $\sin(2\pi kt), \cos(2\pi kt)$), and sample with the Euler scheme using $2$, $10$ and $100$ steps. How many steps are needed?
+
+**Answer**
+
+```{r}
+#| label: flow-matching
+#| tags: [going-further]
+time_features <- function(t) torch_cat(list(t, torch_sin(2 * pi * t), torch_cos(2 * pi * t), torch_sin(4 * pi * t), torch_cos(4 * pi * t)), 2)
+train_flow_matching <- function(x, steps = 6000, batch = 1024, conditional = NULL) {
+  torch_manual_seed(17); set.seed(17)
+  extra <- if (is.null(conditional)) 0 else 1
+  velocity <- mlp(7 + extra, 2, 128)
+  optimizer <- optim_adam(velocity$parameters, lr = 1e-3)
+  for (step in seq_len(steps)) {
+    idx <- sample(x$size(1), batch, replace = TRUE); x1 <- x[idx, ]; x0 <- torch_randn_like(x1); t <- torch_rand(batch, 1)
+    inputs <- list((1 - t) * x0 + t * x1, time_features(t))
+    if (!is.null(conditional)) {                         # label, dropped (set to 0) 20% of the time for guidance
+      label <- conditional[idx, , drop = FALSE] * (torch_rand(batch, 1) > 0.2)$to(dtype = torch_float())
+      inputs <- c(inputs, list(label))
+    }
+    loss <- torch_mean((velocity(torch_cat(inputs, 2)) - (x1 - x0))^2)
+    optimizer$zero_grad(); loss$backward(); optimizer$step()
+  }
+  velocity
+}
+sample_flow <- function(velocity, n = 2000, steps = 100, label = NULL, guidance = 0) {
+  with_no_grad({
+    x <- torch_randn(n, 2)
+    for (i in seq_len(steps)) {
+      t <- time_features(torch_full(c(n, 1), (i - 1) / steps))
+      if (is.null(label)) v <- velocity(torch_cat(list(x, t), 2)) else {
+        v_cond <- velocity(torch_cat(list(x, t, torch_full(c(n, 1), label)), 2))
+        v_free <- velocity(torch_cat(list(x, t, torch_zeros(n, 1)), 2))
+        v <- v_free + (1 + guidance) * (v_cond - v_free)
+      }
+      x <- x + v / steps
+    }
+    as.matrix(x)
+  })
+}
+velocity <- train_flow_matching(moons_tensor)
+plot_samples(list(data = moons, `2 steps` = sample_flow(velocity, steps = 2), `10 steps` = sample_flow(velocity, steps = 10),
+                  `100 steps` = sample_flow(velocity, steps = 100)))
+```
+
+**Conclusion** The flow matching model transports the Gaussian onto the two moons. With $100$ Euler steps, the samples follow both moons (with a few points between them); with $10$ steps, the moons are visible but blurred; with $2$ steps, the samples only form a deformed cloud: the learned velocity field is curved, and a coarse discretization of the ODE goes in straight lines in the wrong direction. The training is a simple regression (no adversary, no likelihood), and the number of steps trades the quality of the samples for their cost, the main practical issue of diffusion models and flow matching (distillation and rectified flows aim at few-step samplers).
+
+---
+
+### Guidance (★★)
+
+A conditional generator $v_\theta(x_t, t, y)$ is trained with the label $y$ of each point (here the moon, $\pm 1$), randomly replaced by a "no label" value ($0$) $20\%$ of the time. *Classifier-free guidance* then extrapolates from the unconditional to the conditional velocity, $v = v_{\text{free}} + (1 + w)(v_{\text{cond}} - v_{\text{free}})$: a large $w$ gives samples that are more typical of their class, at the price of diversity.
+
+**Question** Train a conditional flow matching on the two moons with their labels (with the functions of the previous block), and sample the upper moon ($y = 1$) with the guidance weights $w \in \{0, 1, 3\}$.
+
+**Answer**
+
+```{r}
+#| label: guidance
+#| tags: [going-further]
+set.seed(18)
+moon_label <- rbinom(2000, 1, 0.5)
+t_moon <- runif(2000, 0, pi)
+labelled <- cbind(ifelse(moon_label == 0, cos(t_moon), 1 - cos(t_moon)), ifelse(moon_label == 0, sin(t_moon), 0.5 - sin(t_moon))) +
+  matrix(rnorm(4000, 0, 0.06), 2000, 2)
+labelled <- scale(labelled, center = c(0.5, 0.25), scale = c(0.9, 0.5))
+conditional_velocity <- train_flow_matching(torch_tensor(labelled, dtype = torch_float()),
+                                            conditional = torch_tensor(matrix(ifelse(moon_label == 0, 1, -1)), dtype = torch_float()))
+plot_samples(list(data = labelled, `upper moon, w = 0` = sample_flow(conditional_velocity, label = 1, guidance = 0),
+                  `w = 1` = sample_flow(conditional_velocity, label = 1, guidance = 1), `w = 3` = sample_flow(conditional_velocity, label = 1, guidance = 3)))
+```
+
+**Conclusion** Without guidance ($w = 0$), the conditional model generates the upper moon, with some points spread below it. With $w = 1$, the samples are concentrated on the moon, thinner and more typical, but they no longer cover its ends as uniformly; with $w = 3$, the extrapolation goes too far, and the samples collapse on a few branches, partly outside the moon. Classifier-free guidance trades diversity for typicality: in image generation, a moderate guidance gives images that match the prompt better, a strong one gives saturated, stereotyped images.
+
+---
+
+### A generative adversarial network (★★)
+
+A GAN trains a generator $G(\omega)$ against a discriminator $D(x)$ that tries to tell the data from the samples; at the optimum of the discriminator, the generator minimizes the Jensen–Shannon divergence. The training is a minimax game, often unstable, and prone to *mode collapse*: the generator may cover only a part of the distribution.
+
+**Question** Train a GAN on the two moons ($4000$ steps, generator and discriminator with two hidden layers, non-saturating loss) and plot its samples at several stages of the training. Does it cover both moons?
+
+**Answer**
+
+```{r}
+#| label: gan
+#| tags: [going-further]
+torch_manual_seed(19); set.seed(19)
+generator <- mlp(2, 2, 64); discriminator <- mlp(2, 1, 64)
+opt_g <- optim_adam(generator$parameters, lr = 1e-3, betas = c(0.5, 0.999))
+opt_d <- optim_adam(discriminator$parameters, lr = 1e-3, betas = c(0.5, 0.999))
+snapshots <- list()
+for (step in 1:4000) {
+  real <- moons_tensor[sample(2000, 256), ]; fake <- generator(torch_randn(256, 2))
+  loss_d <- nnf_binary_cross_entropy_with_logits(discriminator(real), torch_ones(256, 1)) +
+    nnf_binary_cross_entropy_with_logits(discriminator(fake$detach()), torch_zeros(256, 1))
+  opt_d$zero_grad(); loss_d$backward(); opt_d$step()
+  loss_g <- nnf_binary_cross_entropy_with_logits(discriminator(generator(torch_randn(256, 2))), torch_ones(256, 1))   # non-saturating
+  opt_g$zero_grad(); loss_g$backward(); opt_g$step()
+  if (step %in% c(250, 1000, 4000)) snapshots[[paste("step", step)]] <- as.matrix(with_no_grad(generator(torch_randn(2000, 2))))
+}
+plot_samples(c(list(data = moons), snapshots))
+```
+
+**Conclusion** The GAN samples evolve during training: after $250$ steps they have collapsed onto a line segment (a *mode collapse*: the generator maps all the noise to a one-dimensional set that fools the discriminator for a while), after $1000$ and $4000$ steps they form a cloud that covers the region of the moons without following their shape, with more points on its borders. The generator has not learned the moons: the minimax training is unstable, and the result depends on the architecture, the learning rates and the number of steps. With much more care (and tricks such as spectral normalization or Wasserstein losses), GANs produce very sharp images, but they are now largely replaced by diffusion models and flow matching, whose training is a simple regression.
+
+---
+
+### An autoregressive model of the digits (★★)
+
+An autoregressive model factorizes the density as $p(x) = \prod_j p(x_j | x_1, \dots, x_{j-1})$: each conditional is a supervised problem, and sampling generates the coordinates one at a time (the principle of the language models, Lecture 6, applied to pixels).
+
+**Question** Binarize the digits (pixel $> 8$), fit for each pixel $j$ (in raster order) a logistic regression of $x_j$ on the $16$ previous pixels, and sample $16$ new binary digits pixel by pixel.
+
+**Answer**
+
+```{r}
+#| label: autoregressive
+#| tags: [going-further]
+binary_pixels <- (pixels > 8) * 1
+models_ar <- map(1:64, function(j) {
+  previous <- max(1, j - 16):(j - 1)
+  if (j == 1 || length(unique(binary_pixels[, j])) == 1) return(mean(binary_pixels[, j]))
+  suppressWarnings(glm(binary_pixels[, j] ~ binary_pixels[, previous, drop = FALSE], family = binomial))
+})
+set.seed(20)
+samples_ar <- matrix(0, 16, 64)
+for (j in 1:64) {
+  model <- models_ar[[j]]
+  p <- if (is.numeric(model) && length(model) == 1) rep(model, 16) else {
+    previous <- max(1, j - 16):(j - 1)
+    beta <- coef(model); beta[is.na(beta)] <- 0
+    plogis(cbind(1, samples_ar[, previous, drop = FALSE]) %*% beta)
+  }
+  samples_ar[, j] <- rbinom(16, 1, p)
+}
+image_tiles(samples_ar * 16, as.character(1:16), nrow = 2)
+```
+
+**Conclusion** The samples of the autoregressive model, generated pixel by pixel from the $16$ previous pixels, have the strokes, the thickness and the global shape of digits, some of them recognizable, others not: each conditional is simple (a logistic regression), but the model only sees $16$ pixels back, two rows of the image. Language models apply the same factorization to words, with conditionals computed by transformers on long contexts.
+
+---
+
+### Comparing generative models (★★★)
+
+A generator can be evaluated by a distance between the distribution of its samples and the one of held-out data. The *sliced Wasserstein distance* averages, over random directions, the 1D Wasserstein distance between the projected samples (computed by sorting); it detects both badly placed samples and missing modes. Copying the training data would also give a small distance: a generator must also be compared with the training set.
+
+**Question** Compute the sliced Wasserstein distance ($200$ directions) between $2000$ fresh points of the two moons and the samples of the Gaussian, the mixture of Gaussians, the VAE, Real NVP, flow matching ($100$ steps) and the GAN, as well as the training set itself. Rank the generators.
+
+**Answer**
+
+```{r}
+#| label: compare-generators
+#| tags: [going-further]
+sliced_wasserstein <- function(a, b, theta) {
+  mean(map_dbl(theta, \(t) { u <- c(cos(t), sin(t)); mean(abs(sort(a %*% u) - sort(b %*% u))) }))
+}
+set.seed(21)
+fresh <- two_moons(2000)
+generators <- list(`training set` = moons, Gaussian = gaussian, `mixture of 10 Gaussians` = sim(gmm10$modelName, gmm10$parameters, 2000)[, -1],
+                   VAE = vae_samples, `Real NVP` = nvp_samples, `flow matching` = sample_flow(velocity, steps = 100), GAN = snapshots[["step 4000"]])
+theta <- runif(200, 0, pi)
+tibble(generator = names(generators), `sliced Wasserstein distance` = map_dbl(generators, \(g) sliced_wasserstein(g, fresh, theta))) |>
+  arrange(`sliced Wasserstein distance`)
+```
+
+**Conclusion** With the same 200 directions and fresh sample for every comparison, the 10-component Gaussian mixture has sliced Wasserstein distance $0.0340$, followed by flow matching at $0.0359$. The training-sample reference gives $0.0376$. Sampling both the latent code and the decoder noise gives the VAE $0.0786$. GAN and Real NVP score $0.125$ and $0.126$, and the single Gaussian scores $0.189$. These are empirical distances for one comparison. A generator that copies its training set would match the reference score, so the distance alone cannot establish novelty.
+
+---
+
+## About this lab
+
+**Use of AI.** Artificial intelligence tools have been used to revise the content of this lab. The main contributor takes full responsibility for this content.
+
+**License.** The texts of this lab are under the [Creative Commons Attribution-ShareAlike 4.0](https://creativecommons.org/licenses/by-sa/4.0/) license (CC BY-SA 4.0), and its code under the [MIT](https://opensource.org/license/mit) license; the datasets keep their own licenses. Main contributor: E. Le Pennec. Contributors: S. Boucheron, A. Dieuleveut, A.K. Fermin, S. Gadat, S. Gaiffas, B. Goujaud, A. Guilloux, Ch. Keribin, Th. Klein, E. Matzner, J. Read, M. Sangnier, E. Scornet.
