@@ -598,10 +598,13 @@ Spark distributes the data and the computations over a cluster; locally, it runs
 #| tags: [going-further]
 #| eval: false
 # Windows only, once (after sparklyr::spark_install()): Hadoop's winutils.exe, where sparklyr looks for it
-winutils_dir <- file.path(sparklyr::spark_home_dir(), "tmp", "hadoop", "bin")
-dir.create(winutils_dir, recursive = TRUE, showWarnings = FALSE)
-download.file("https://github.com/steveloughran/winutils/raw/master/hadoop-3.0.0/bin/winutils.exe",
-              file.path(winutils_dir, "winutils.exe"), mode = "wb")
+# (nothing is done on Linux, macOS and Colab, or if Spark is not installed)
+if (.Platform$OS.type == "windows" && nrow(sparklyr::spark_installed_versions()) > 0) {
+  winutils_dir <- file.path(sparklyr::spark_home_dir(), "tmp", "hadoop", "bin")
+  dir.create(winutils_dir, recursive = TRUE, showWarnings = FALSE)
+  download.file("https://github.com/steveloughran/winutils/raw/master/hadoop-3.0.0/bin/winutils.exe",
+                file.path(winutils_dir, "winutils.exe"), mode = "wb")
+}
 ```
 
 **Question** Copy the flights to a local Spark session, compute the mean delay by airline with `dplyr` verbs and with an SQL query, and fit the third model with `ml_linear_regression`. Compare its coefficients with `lm`.
