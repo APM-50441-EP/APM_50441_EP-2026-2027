@@ -51,7 +51,7 @@ The full dataset ($5.8$ million flights, $1.4$ GB in memory) is too large for th
 
 ## 1. Reading, storing and sampling
 
-**Question** *Predict before you run:* which reader is the fastest? Read `data/flights_sample.csv.gz` with `readr::read_csv`, `data.table::fread` and `arrow::read_csv_arrow`, and compare their times with `bench::mark` ($3$ iterations, `check = FALSE`). What is the size of the data in memory (`lobstr::obj_size`)?
+**Question** *Predict before you run:* which reader is the fastest? Read `data/flights_sample.csv.gz` with `readr::read_csv`, `data.table::fread` and `arrow::read_csv_arrow`, and compare their times with `bench::mark` ($3$ iterations, `check = FALSE`). What is the size of the data in memory (`lobstr::obj_size`)? Keep the data frame read by `readr` in `flights`: the rest of the lab uses it.
 
 **Answer**
 
