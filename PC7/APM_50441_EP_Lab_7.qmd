@@ -41,6 +41,9 @@ if (!file.exists("data/flights_sample.csv.gz")) {
     download.file(paste0("https://raw.githubusercontent.com/APM-50441-EP/APM_50441_EP-2026-2027/main/PC7/data/", f), file.path("data", f), mode = "wb")
   }
 }
+for (f in c("cumsum.cc", "flights_api.R", "flights_app.R")) {  # the code files of the lab (Parts 3 and 5)
+  if (!file.exists(f)) download.file(paste0("https://raw.githubusercontent.com/APM-50441-EP/APM_50441_EP-2026-2027/main/PC7/", f), f, mode = "wb")
+}
 airlines <- read_csv("data/airlines.csv", show_col_types = FALSE)
 ```
 
@@ -303,7 +306,7 @@ R matrices are stored column by column: reading a column reads contiguous memory
 
 ### How many workers? (★)
 
-**Question** Run the $40$ tasks of the cross validation of Part 4 with $1$, $2$, $4$ and $8$ `mirai` workers (`mirai::daemons(k)`), and plot the speed-up against the number of workers, with the number of cores of your machine (`parallel::detectCores()`). Fit Amdahl's law $S(P) = 1/((1-f) + f/P)$ to the measured speed-ups. What limits the speed-up? (PC7, *Speed-up laws*.)
+**Question** Run the $40$ tasks of the cross validation of Part 4 with $1$, $2$, $4$ and $8$ `mirai` workers (`mirai::daemons(k)`; at most $4$ on a machine with few cores, such as Colab: each worker holds a copy of the data and of its fits, about $1$ GB here), and plot the speed-up against the number of workers, with the number of cores of your machine (`parallel::detectCores()`). Fit Amdahl's law $S(P) = 1/((1-f) + f/P)$ to the measured speed-ups. What limits the speed-up? (PC7, *Speed-up laws*.)
 
 **Answer**
 
