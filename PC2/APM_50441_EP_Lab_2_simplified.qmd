@@ -246,7 +246,7 @@ folds <- vfold_cv(train_tc, v = 5, repeats = 3, strata = classes)
 ggplot(train_tc, aes(PredictorA, PredictorB, color = classes)) + geom_point() + coord_equal()
 ```
 
-**Question** Define two recipes (normalized predictors, and normalized predictors with polynomials of degree $2$) and the following models: logistic regression, $k$-NN ($k$ tuned), LDA, QDA, naive Bayes, penalized logistic regression (`glmnet`, penalty and mixture tuned), SVM with a radial kernel (`kernlab`, cost and scale tuned), a one-hidden-layer perceptron (`brulee`, size and penalty tuned) and a classification tree (cost-complexity tuned). Build a `workflow_set()` crossing them (the polynomial recipe only for the logistic and penalized logistic regressions), and evaluate it with `workflow_map("tune_grid", grid = 6)` on `folds` for the accuracy, the ROC AUC and the Brier score. Rank the workflows.
+**Question** Define two recipes (normalized predictors, and normalized predictors with polynomials of degree $2$) and the following models: logistic regression, $k$-NN ($k$ tuned), LDA, QDA, naive Bayes, penalized logistic regression (`glmnet`, penalty and mixture tuned), SVM with a radial kernel (`kernlab`, cost and scale tuned) and a classification tree (cost-complexity tuned). (The perceptron, much slower to tune, is added in *To go further*.) Build a `workflow_set()` crossing them (the polynomial recipe only for the logistic and penalized logistic regressions), and evaluate it with `workflow_map("tune_grid", grid = 6)` on `folds` for the accuracy, the ROC AUC and the Brier score. Rank the workflows.
 
 **Answer**
 

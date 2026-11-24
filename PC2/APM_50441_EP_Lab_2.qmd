@@ -246,7 +246,7 @@ folds <- vfold_cv(train_tc, v = 5, repeats = 3, strata = classes)
 ggplot(train_tc, aes(PredictorA, PredictorB, color = classes)) + geom_point() + coord_equal()
 ```
 
-**Question** Define two recipes (normalized predictors, and normalized predictors with polynomials of degree $2$) and the following models: logistic regression, $k$-NN ($k$ tuned), LDA, QDA, naive Bayes, penalized logistic regression (`glmnet`, penalty and mixture tuned), SVM with a radial kernel (`kernlab`, cost and scale tuned), a one-hidden-layer perceptron (`brulee`, size and penalty tuned) and a classification tree (cost-complexity tuned). Build a `workflow_set()` crossing them (the polynomial recipe only for the logistic and penalized logistic regressions), and evaluate it with `workflow_map("tune_grid", grid = 6)` on `folds` for the accuracy, the ROC AUC and the Brier score. Rank the workflows.
+**Question** Define two recipes (normalized predictors, and normalized predictors with polynomials of degree $2$) and the following models: logistic regression, $k$-NN ($k$ tuned), LDA, QDA, naive Bayes, penalized logistic regression (`glmnet`, penalty and mixture tuned), SVM with a radial kernel (`kernlab`, cost and scale tuned) and a classification tree (cost-complexity tuned). (The perceptron, much slower to tune, is added in *To go further*.) Build a `workflow_set()` crossing them (the polynomial recipe only for the logistic and penalized logistic regressions), and evaluate it with `workflow_map("tune_grid", grid = 6)` on `folds` for the accuracy, the ROC AUC and the Brier score. Rank the workflows.
 
 **Answer**
 
@@ -283,7 +283,7 @@ The following blocks are optional and independent: each of them only uses the ob
 | Regularization paths | Regularization | ★ |
 | Kernel trick and random features | SVM | ★★ |
 | Double descent | Deep learning, overparametrization | ★★★ |
-| The width of a perceptron | Neural networks | ★★ |
+| The perceptron: width and tuning | Neural networks | ★★ |
 | AutoML in R: racing and stacking | AutoML (Lecture 1) | ★★ |
 | AutoML in R: Bayesian optimization over learners with mlr3 | AutoML (Lecture 1) | ★★ |
 | Error estimation schemes: ESL Figure 7.1 | Risk estimation (Lecture 1) | ★★ |
@@ -367,11 +367,21 @@ In a linear regression on $D$ random features, the least squares fit interpolate
 
 ---
 
-### The width of a perceptron (★★)
+### The perceptron: width and tuning (★★)
 
 The universal approximation theorem says that a perceptron with one hidden layer can approximate any continuous function, provided its hidden layer is large enough. In practice, the width interacts with the training (epochs, penalty).
 
 **Question** Fit `mlp()` (`brulee`, $200$ epochs, penalty $10^{-3}$) with $1, 2, 4, 8, 16, 32$ hidden units on our simulated problem ($n = 500$), and plot the excess risk and the decision maps for $1$, $4$ and $32$ units.
+
+**Answer**
+
+```{r}
+# Your code here
+```
+
+---
+
+**Question** Add the perceptron (`brulee`, $200$ epochs, number of hidden units and penalty tuned) to the comparison of Part 5: evaluate it with `tune_grid()` (grid of $6$) on the same `folds`, and rank it with the workflows of Part 5. Each fit trains a network (about $10$ s on Colab): expect several minutes.
 
 **Answer**
 

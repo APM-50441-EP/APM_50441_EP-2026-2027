@@ -13,7 +13,7 @@ pkgs <- list(
   common = c("tidyverse", "patchwork", "knitr", "rmarkdown", "IRkernel"),
   lab2 = c(
     # core: simulated problem, plug-in, ERM, kNN, then the tidymodels workflow on TwoClass
-    "tidymodels", "discrim", "naivebayes", "kknn", "glmnet", "kernlab", "brulee", "torch",
+    "tidymodels", "discrim", "naivebayes", "kknn", "glmnet", "kernlab", "brulee", "torch", "mvtnorm", "MASS",
     # to go further: R AutoML, regularization paths, LOESS
     "finetune", "stacks", "mlr3", "mlr3learners", "mlr3pipelines", "mlr3tuning", "mlr3mbo", "e1071", "mirai", "ranger", "xgboost",
     "rpart", "future", "furrr"
@@ -26,11 +26,12 @@ pkgs <- list(
   ),
   lab7 = c(
     # core: I/O, split/apply/combine, profiling, parallelism, serving
-    "data.table", "R.utils", "arrow", "duckdb", "duckplyr", "dbplyr", "DBI", "bench", "profvis", "lobstr", "Rcpp",
+    "data.table", "R.utils", "arrow", "duckdb", "duckplyr", "dbplyr", "DBI", "bench", "profvis", "lobstr", "Rcpp", "pkgbuild",
     "mirai", "carrier", "future", "furrr", "rsample", "butcher", "plumber2", "callr", "httr2", "bslib",
     "shiny", "bsicons", "testthat",
     # to go further: Spark, targets, in-database scoring, model versioning
-    "sparklyr", "targets", "crew", "orbital", "tidypredict", "vetiver", "pins", "plumber"  # vetiver generates plumber (v1) APIs
+    "sparklyr", "targets", "crew", "orbital", "tidypredict", "vetiver", "pins", "plumber",  # vetiver generates plumber (v1) APIs
+    "tidymodels"  # the workflow translated into SQL by orbital
   )
 )
 
@@ -52,7 +53,9 @@ install_missing <- function(packages) {
 install_lab <- function(lab = c("lab2", "lab4", "lab7")) {
   lab <- match.arg(lab, several.ok = TRUE)
   install_missing(c(pkgs$common, unlist(pkgs[lab])))
-  # {torch} downloads its own C++ library (libtorch) the first time
+  # {torch} downloads its own C++ library (libtorch) the first time; without TORCH_INSTALL, loading it in an
+  # interactive session (Colab, RStudio) stops on a "Do you want to continue?" prompt
+  Sys.setenv(TORCH_INSTALL = "1")
   if (any(c("lab2", "lab4") %in% lab) && requireNamespace("torch", quietly = TRUE) && !torch::torch_is_installed()) {
     torch::install_torch()
   }
