@@ -14,8 +14,9 @@ pkgs <- list(
   lab2 = c(
     # core: simulated problem, plug-in, ERM, kNN, then the tidymodels workflow on TwoClass
     "tidymodels", "discrim", "naivebayes", "kknn", "glmnet", "kernlab", "brulee", "torch", "mvtnorm", "MASS",
-    # to go further: R AutoML, regularization paths, LOESS
-    "finetune", "stacks", "mlr3", "mlr3learners", "mlr3pipelines", "mlr3tuning", "mlr3mbo", "e1071", "mirai", "ranger", "xgboost",
+    # to go further: R AutoML (lme4 is needed by tune_race_anova() with repeated cross validation), regularization
+    # paths, LOESS
+    "finetune", "lme4", "stacks", "mlr3", "mlr3learners", "mlr3pipelines", "mlr3tuning", "mlr3mbo", "e1071", "mirai", "ranger", "xgboost",
     "rpart", "future", "furrr"
   ),
   lab4 = c(
@@ -53,11 +54,11 @@ install_missing <- function(packages) {
 install_lab <- function(lab = c("lab2", "lab4", "lab7")) {
   lab <- match.arg(lab, several.ok = TRUE)
   install_missing(c(pkgs$common, unlist(pkgs[lab])))
-  # {torch} downloads its own C++ library (libtorch) the first time; without TORCH_INSTALL, loading it in an
-  # interactive session (Colab, RStudio) stops on a "Do you want to continue?" prompt
-  Sys.setenv(TORCH_INSTALL = "1")
-  if (any(c("lab2", "lab4") %in% lab) && requireNamespace("torch", quietly = TRUE) && !torch::torch_is_installed()) {
-    torch::install_torch()
+  # {torch} downloads its own C++ library (libtorch) the first time. Loading torch to do it in an interactive session
+  # (Colab, RStudio) asks "Do you want to continue?" (torch 0.17, whatever TORCH_INSTALL says): the download runs in
+  # a separate, non-interactive R process, and torch is loaded normally afterwards (no restart needed)
+  if (any(c("lab2", "lab4") %in% lab) && nzchar(system.file(package = "torch"))) {
+    system2(file.path(R.home("bin"), "Rscript"), c("-e", shQuote("if (!torch::torch_is_installed()) torch::install_torch()")))
   }
 }
 
