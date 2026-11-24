@@ -64,7 +64,7 @@ reading <- bench::mark(
   data.table = fread("data/flights_sample.csv.gz"),
   arrow = read_csv_arrow("data/flights_sample.csv.gz"),
   iterations = 3, check = FALSE, filter_gc = FALSE)
-reading |> select(expression, min, median, mem_alloc)
+reading |> transmute(reader = as.character(expression), min, median, mem_alloc)
 flights <- read_csv("data/flights_sample.csv.gz", col_types = col_types)
 lobstr::obj_size(flights)
 ```
@@ -88,7 +88,7 @@ december <- function(data) data |> filter(MONTH == 12) |> group_by(AIRLINE) |>
   summarise(arrival_delay = mean(ARRIVAL_DELAY, na.rm = TRUE)) |> collect()
 bench::mark(parquet = december(flights_ds),
             csv = december(read_csv("data/flights_sample.csv.gz", col_types = col_types)),
-            iterations = 3, check = FALSE, filter_gc = FALSE) |> select(expression, min, median, mem_alloc)
+            iterations = 3, check = FALSE, filter_gc = FALSE) |> transmute(format = as.character(expression), min, median, mem_alloc)
 ```
 
 **Conclusion** The Parquet dataset ($12$ files, one per month) is about as large on disk as the gzipped CSV ($28$ MB against $23$ MB, with the default *snappy* compression, which favors speed over size). But the query on December is about $20$ times faster ($0.1$ s against $2$ s) and allocates $35$ times less memory: Arrow only opens the partition `MONTH=12` (partition pruning), only reads the $3$ needed columns (columnar format), and the data are binary, with no parsing. The data are never fully loaded in R.
@@ -365,7 +365,7 @@ tiny <- bench::mark(sequential = map_dbl(1:40, \(i) mean(rnorm(100))),
 mirai::daemons(0)
 c(`same results` = isTRUE(all.equal(parallel_rmse, tasks$rmse)), sequential = sequential_time, `parallel (4 workers)` = parallel_time,
   `speed-up` = sequential_time / parallel_time)
-tiny |> select(expression, median)
+tiny |> transmute(version = as.character(expression), median)
 ```
 
 **Conclusion** With $4$ workers, the cross validation is $2$ to $2.6$ times faster (about $14$ s instead of $30$ to $35$ s), rather than $4$ times: sending the data to the workers, starting the tasks and collecting the results cost time, and the tasks are not all of the same length. For the $40$ tiny tasks, the parallel version is $6$ to $8$ times *slower* than the sequential one (about $7$ ms against $1$ ms): the overhead of each task is much larger than its computation. Parallelism pays off only for tasks that are long compared with its overhead (PC7, *Speed-up laws*, with an overhead per worker).
@@ -550,7 +550,7 @@ R matrices are stored column by column: reading a column reads contiguous memory
 m <- matrix(rnorm(5000 * 5000), 5000, 5000)
 bench::mark(`columns one by one` = for (j in 1:5000) sum(m[, j]), `rows one by one` = for (i in 1:5000) sum(m[i, ]),
             colSums = colSums(m), rowSums = rowSums(m), iterations = 3, check = FALSE, filter_gc = FALSE) |>
-  select(expression, median)
+  transmute(loop = as.character(expression), median)
 rm(m)
 ```
 
